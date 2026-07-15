@@ -7,12 +7,13 @@
 //! invariant (see `docs/grouped_orientation_design.md` in the consuming repo):
 //!
 //! * the initial solution encodes a valid partition,
-//! * every regular move preserves the moved copy's rotation
-//!   (`SeparatorConfig::preserve_rotations`),
+//! * every regular move preserves the moved copy's rotation (the per-item lock
+//!   bitmap `optimize()` derives from this spec),
 //! * only the group-flip disruption changes rotations, one whole garment at a time.
 //!
 //! With `None` passed everywhere, nothing in this module executes.
 
+use jagua_rs::entities::Layout;
 use jagua_rs::probs::spp::entities::SPInstance;
 
 /// Side-channel description of the garment groups of an instance.
@@ -91,4 +92,44 @@ impl GroupedOrientationSpec {
         }
         Ok(())
     }
+}
+
+/// Classifies a rotation (radians) as the 180°-direction class. Group items carry
+/// exactly two allowed rotations, one per class; cosine sign is robust to any
+/// normalization of the angle.
+#[inline]
+pub fn is_dir_180(rotation_rad: f32) -> bool {
+    rotation_rad.cos() <= 0.0
+}
+
+/// Whether `layout` satisfies the group counting invariant: for every group there
+/// is a single n0 such that every member has exactly n0 * per_garment copies in
+/// the 0° class. O(placed items); used in debug assertions and tests.
+pub fn invariant_holds(layout: &Layout, spec: &GroupedOrientationSpec) -> bool {
+    let max_id = spec
+        .groups
+        .iter()
+        .flat_map(|g| g.members.iter().map(|&(id, _)| id))
+        .max()
+        .unwrap_or(0);
+    let mut zeros = vec![0usize; max_id + 1];
+    for (_, pi) in layout.placed_items.iter() {
+        if pi.item_id <= max_id && !is_dir_180(pi.d_transf.rotation()) {
+            zeros[pi.item_id] += 1;
+        }
+    }
+    spec.groups.iter().all(|g| {
+        let mut n0: Option<usize> = None;
+        g.members.iter().all(|&(id, pg)| {
+            let z = zeros[id];
+            z % pg == 0
+                && match n0 {
+                    None => {
+                        n0 = Some(z / pg);
+                        true
+                    }
+                    Some(prev) => prev == z / pg,
+                }
+        })
+    })
 }

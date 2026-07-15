@@ -9,11 +9,14 @@ use float_cmp::approx_eq;
 use itertools::Itertools;
 use jagua_rs::collision_detection::hazards::HazardEntity;
 use jagua_rs::entities::{Instance, Layout, PItemKey};
+use jagua_rs::geometry::geo_enums::RotationRange;
 use jagua_rs::geometry::geo_traits::CollidesWith;
+use jagua_rs::geometry::DTransformation;
 use jagua_rs::probs::spp::entities::{SPInstance, SPSolution};
 use log::{debug, info, warn};
 use ordered_float::OrderedFloat;
-use rand::prelude::{Distribution, IteratorRandom};
+use rand::prelude::{Distribution, IndexedRandom, IteratorRandom};
+use rand::RngExt;
 use rand_distr::Normal;
 use slotmap::SecondaryMap;
 use std::cmp::Reverse;
@@ -33,6 +36,11 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
     info!("[EXPL] starting optimization with initial width: {:.3} ({:.3}%)",current_width,sep.prob.density() * 100.0);
 
     let mut infeas_sol_pool: Vec<(SPSolution, f32)> = vec![];
+
+    debug_assert!(
+        grouped.map_or(true, |s| crate::grouped::invariant_holds(&sep.prob.layout, s)),
+        "[EXPL] initial solution violates the group orientation invariant"
+    );
 
     // Phase statistics: plain integers on this (master) thread; reported once at phase end.
     let mut stats = SearchStats { grouped_active: grouped.is_some(), ..SearchStats::default() };
@@ -97,13 +105,23 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
                 selected_sol
             };
 
-            // Rollback to this solution and disrupt it.
+            // Rollback to this solution and disrupt it: a group flip (grouped mode,
+            // with probability p_flip) or the swap-two-large-items move.
             sep.rollback(selected_sol, None);
             stats.n_disruptions += 1;
-            // Group flips are wired here in a later phase; today every disruption is a swap.
-            disrupt_solution(sep, config);
-            stats.n_swaps += 1;
-            last_disruption = Some(DisruptionKind::Swap);
+            let flipped = match grouped {
+                Some(spec) if sep.rng.random::<f32>() < spec.flip.p_flip => {
+                    disrupt_by_group_flip(sep, spec, &mut stats)
+                }
+                _ => false,
+            };
+            if flipped {
+                last_disruption = Some(DisruptionKind::Flip);
+            } else {
+                disrupt_solution(sep, config);
+                stats.n_swaps += 1;
+                last_disruption = Some(DisruptionKind::Swap);
+            }
         }
     }
 
@@ -123,8 +141,138 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
 #[derive(Debug, Clone, Copy)]
 enum DisruptionKind {
     Swap,
-    #[allow(dead_code)] // constructed once the group-flip move lands (phase 5)
     Flip,
+}
+
+/// Grouped-orientation disruption: flips `n_garments_per_flip` whole garments
+/// 180° in place (see `crate::grouped`). Returns whether at least one garment was
+/// flipped; on false the caller falls back to the swap disruption.
+fn disrupt_by_group_flip(
+    sep: &mut Separator,
+    spec: &crate::grouped::GroupedOrientationSpec,
+    stats: &mut SearchStats,
+) -> bool {
+    let mut any = false;
+    for _ in 0..spec.flip.n_garments_per_flip {
+        any |= flip_one_garment(sep, spec, stats);
+    }
+    any
+}
+
+/// Flips one garment: picks a (group, source direction) uniformly among the valid
+/// pairs, then — exploiting piece interchangeability — assembles the cheapest
+/// "garment" to repair: an anchor copy of the group's largest piece plus, per
+/// member piece type, its `per_garment` copies nearest the anchor (spatial
+/// coherence keeps the injected overlap local). Each selected copy is rotated to
+/// the opposite allowed angle about its own placed centroid: with world centroid
+/// C and translation t, the in-place pose is r' = opposite(r), t' = 2C - t
+/// (since R_{r+pi}(c) = -R_r(c)). The following separation repairs the overlap;
+/// rotation-locked moves guarantee the flip cannot be undone piecemeal, and the
+/// infeasible-solution pool provides the accept/reject pressure.
+fn flip_one_garment(
+    sep: &mut Separator,
+    spec: &crate::grouped::GroupedOrientationSpec,
+    stats: &mut SearchStats,
+) -> bool {
+    use crate::grouped::is_dir_180;
+
+    // Census of the group members' placed copies: item_id -> (pk, is180, centroid).
+    let n_items = sep.instance.items.len();
+    let mut copies: Vec<Vec<(PItemKey, bool, (f32, f32))>> = vec![Vec::new(); n_items];
+    for (pk, pi) in sep.prob.layout.placed_items.iter() {
+        let c = pi.shape.centroid();
+        copies[pi.item_id].push((pk, is_dir_180(pi.d_transf.rotation()), (c.0, c.1)));
+    }
+
+    // Valid (group, source-direction) pairs: at least one whole garment faces it.
+    let mut cands: Vec<(usize, bool)> = Vec::new();
+    for (gi, g) in spec.groups.iter().enumerate() {
+        let (item0, pg0) = g.members[0];
+        let n0 = copies[item0].iter().filter(|(_, d, _)| !d).count() / pg0;
+        if n0 >= 1 {
+            cands.push((gi, false));
+        }
+        if g.quantity.saturating_sub(n0) >= 1 {
+            cands.push((gi, true));
+        }
+    }
+    let Some(&(gi, src180)) = cands.choose(&mut sep.rng) else {
+        return false;
+    };
+    let group = &spec.groups[gi];
+
+    // Anchor: a random source-direction copy of the group's largest-area member.
+    let largest = group
+        .members
+        .iter()
+        .max_by(|a, b| {
+            sep.instance
+                .item(a.0)
+                .shape_cd
+                .area
+                .total_cmp(&sep.instance.item(b.0).shape_cd.area)
+        })
+        .expect("groups have >= 1 member (validated)")
+        .0;
+    let Some(&(_, _, anchor)) = copies[largest]
+        .iter()
+        .filter(|(_, d, _)| *d == src180)
+        .choose(&mut sep.rng)
+    else {
+        return false;
+    };
+
+    // Select per_garment nearest source-direction copies of every member and
+    // compute their flipped poses. No mutation until the whole garment resolves.
+    let dist2 = |a: (f32, f32)| (a.0 - anchor.0).powi(2) + (a.1 - anchor.1).powi(2);
+    let mut moves: Vec<(PItemKey, DTransformation)> = Vec::new();
+    for &(item_id, pg) in &group.members {
+        let RotationRange::Discrete(allowed) = &sep.instance.item(item_id).allowed_rotation
+        else {
+            return false; // group members must carry discrete two-class rotations
+        };
+        let Some(target) = allowed.iter().copied().find(|r| is_dir_180(*r) != src180) else {
+            return false;
+        };
+        let mut same: Vec<(PItemKey, (f32, f32))> = copies[item_id]
+            .iter()
+            .filter(|(_, d, _)| *d == src180)
+            .map(|&(pk, _, c)| (pk, c))
+            .collect();
+        if same.len() < pg {
+            debug_assert!(false, "[FLIP] fewer source copies than per_garment — invariant broken");
+            return false;
+        }
+        same.sort_by(|a, b| dist2(a.1).total_cmp(&dist2(b.1)));
+        for &(pk, c) in same.iter().take(pg) {
+            let t = sep.prob.layout.placed_items[pk].d_transf.translation();
+            moves.push((
+                pk,
+                DTransformation::new(target, (2.0 * c.0 - t.0, 2.0 * c.1 - t.1)),
+            ));
+        }
+    }
+
+    let n_pieces = moves.len();
+    let mut loss_injected = 0.0;
+    for (pk, dt) in moves {
+        let new_pk = sep.move_item(pk, dt);
+        loss_injected += sep.ct.get_loss(new_pk);
+    }
+    info!(
+        "[FLIP] flipped garment of group {gi} ({n_pieces} pieces, {} -> {}), loss injected: {:.3}",
+        if src180 { "180" } else { "0" },
+        if src180 { "0" } else { "180" },
+        loss_injected,
+    );
+    stats.n_flips += 1;
+    stats.n_garments_flipped += 1;
+    stats.flip_loss_injected += loss_injected;
+    debug_assert!(
+        crate::grouped::invariant_holds(&sep.prob.layout, spec),
+        "[FLIP] group orientation invariant broken by flip"
+    );
+    true
 }
 
 fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) {
