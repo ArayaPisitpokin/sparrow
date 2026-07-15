@@ -22,9 +22,10 @@ pub mod compress;
 ///Algorithm 11 from https://doi.org/10.48550/arXiv.2509.13329
 ///
 /// `grouped`: optional grouped-orientation spec (see `crate::grouped`). Requires
-/// `preserve_rotations` set in both phases' separator configs, and an
-/// `initial_solution` encoding a valid orientation partition (free LBF construction
-/// cannot honor the group invariant). `None` = upstream behavior.
+/// an `initial_solution` encoding a valid orientation partition (free LBF
+/// construction cannot honor the group invariant). Group members get per-item
+/// rotation locks; ungrouped items keep their full rotation freedom.
+/// `None` = upstream behavior.
 pub fn optimize(
     instance: SPInstance,
     mut rng: Xoshiro256PlusPlus,
@@ -41,15 +42,22 @@ pub fn optimize(
         spec.validate(&instance)
             .unwrap_or_else(|e| panic!("[OPT] invalid GroupedOrientationSpec: {e}"));
         assert!(
-            expl_config.separator_config.preserve_rotations
-                && cmpr_config.separator_config.preserve_rotations,
-            "[OPT] grouped-orientation mode requires preserve_rotations in both separator configs"
-        );
-        assert!(
             initial_solution.is_some(),
             "[OPT] grouped-orientation mode requires an initial solution encoding a valid partition"
         );
     }
+
+    // Per-item rotation locks: group members are locked, everything else stays free
+    // (e.g. direction-free pieces keep both orientations). Built once per solve.
+    let locked_items: Option<std::sync::Arc<[bool]>> = grouped.map(|spec| {
+        let mut locked = vec![false; instance.items.len()];
+        for g in &spec.groups {
+            for &(item_id, _) in &g.members {
+                locked[item_id] = true;
+            }
+        }
+        locked.into()
+    });
 
     // First build an initial solution if none is provided
     let start_prob = match initial_solution {
@@ -67,7 +75,7 @@ pub fn optimize(
 
     // Begin by executing the exploration phase
     terminator.new_timeout(expl_config.time_limit);
-    let mut expl_separator = Separator::new(instance.clone(), start_prob, next_rng(), expl_config.separator_config);
+    let mut expl_separator = Separator::new(instance.clone(), start_prob, next_rng(), expl_config.separator_config, locked_items.clone());
     let solutions = exploration_phase(
         &instance,
         &mut expl_separator,
@@ -80,7 +88,7 @@ pub fn optimize(
 
     // Start the compression phase from the final solution from the exploration phase
     terminator.new_timeout(cmpr_config.time_limit);
-    let mut cmpr_separator = Separator::new(expl_separator.instance, expl_separator.prob, next_rng(), cmpr_config.separator_config);
+    let mut cmpr_separator = Separator::new(expl_separator.instance, expl_separator.prob, next_rng(), cmpr_config.separator_config, locked_items);
     let cmpr_sol = compression_phase(
         &instance,
         &mut cmpr_separator,

@@ -12,6 +12,7 @@ use log::debug;
 use rand::prelude::SliceRandom;
 use std::iter::Sum;
 use std::ops::AddAssign;
+use std::sync::Arc;
 use rand::rngs::Xoshiro256PlusPlus;
 use tap::Tap;
 
@@ -21,8 +22,8 @@ pub struct SeparatorWorker {
     pub ct: CollisionTracker,
     pub rng: Xoshiro256PlusPlus,
     pub sample_config: SampleConfig,
-    /// Grouped-orientation mode: regular moves keep the moved copy's rotation.
-    pub preserve_rotations: bool,
+    /// Grouped-orientation mode: per-item rotation locks (item_id -> locked).
+    pub locked_items: Option<Arc<[bool]>>,
 }
 
 impl SeparatorWorker {
@@ -51,11 +52,14 @@ impl SeparatorWorker {
                 let item_id = self.prob.layout.placed_items[pk].item_id;
                 let item = self.instance.item(item_id);
 
-                // Grouped-orientation mode: the copy must keep its current rotation.
-                // (one branch per move; resolved before the ~10^3 sample evaluations below)
-                let rot_lock = match self.preserve_rotations {
-                    true => Some(self.prob.layout.placed_items[pk].d_transf.rotation()),
-                    false => None,
+                // Grouped-orientation mode: locked items keep their current rotation.
+                // (one Option check + one slice index per move; resolved before the
+                // ~10^3 sample evaluations below)
+                let rot_lock = match self.locked_items.as_deref() {
+                    Some(locked) if locked[item_id] => {
+                        Some(self.prob.layout.placed_items[pk].d_transf.rotation())
+                    }
+                    _ => None,
                 };
 
                 // Create an 'evaluator' to perform collision detection and collision quantification of the samples during the search

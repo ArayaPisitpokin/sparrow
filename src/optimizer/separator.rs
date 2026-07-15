@@ -17,6 +17,7 @@ use rand::rngs::Xoshiro256PlusPlus;
 use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator;
 use rayon::ThreadPool;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SeparatorConfig {
@@ -25,10 +26,6 @@ pub struct SeparatorConfig {
     pub n_workers: usize,
     pub log_level: Level,
     pub sample_config: SampleConfig,
-    /// When true, every regular move keeps the moved copy's current rotation
-    /// (grouped-orientation mode). Must be set iff a `GroupedOrientationSpec` is
-    /// passed to `optimize()`.
-    pub preserve_rotations: bool,
 }
 
 pub struct Separator {
@@ -39,6 +36,10 @@ pub struct Separator {
     pub workers: Vec<SeparatorWorker>,
     pub config: SeparatorConfig,
     pub thread_pool: Option<ThreadPool>,
+    /// Grouped-orientation mode: per-item rotation locks (item_id -> locked).
+    /// `None` = upstream behavior. Group members are locked (regular moves keep the
+    /// copy's rotation); ungrouped items (e.g. direction-free pieces) stay free.
+    pub locked_items: Option<Arc<[bool]>>,
     /// Cumulative counters over this separator's lifetime (one optimization phase).
     /// Plain integers, only touched once per `separate()` call on the master thread.
     pub cum_separate_calls: u64,
@@ -47,7 +48,7 @@ pub struct Separator {
 }
 
 impl Separator {
-    pub fn new(instance: SPInstance, prob: SPProblem, mut rng: Xoshiro256PlusPlus, config: SeparatorConfig) -> Self {
+    pub fn new(instance: SPInstance, prob: SPProblem, mut rng: Xoshiro256PlusPlus, config: SeparatorConfig, locked_items: Option<Arc<[bool]>>) -> Self {
         let ct = CollisionTracker::new(&prob.layout);
         let workers = (0..config.n_workers).map(|_|
             SeparatorWorker {
@@ -56,7 +57,7 @@ impl Separator {
                 ct: ct.clone(),
                 rng: Xoshiro256PlusPlus::seed_from_u64(rng.random()),
                 sample_config: config.sample_config,
-                preserve_rotations: config.preserve_rotations,
+                locked_items: locked_items.clone(),
             }).collect();
 
         let pool = if cfg!(target_arch = "wasm32") {
@@ -75,6 +76,7 @@ impl Separator {
             workers,
             config,
             thread_pool: pool,
+            locked_items,
             cum_separate_calls: 0,
             cum_moves: 0,
             cum_evals: 0,
@@ -267,7 +269,7 @@ impl Separator {
                 ct: self.ct.clone(),
                 rng: Xoshiro256PlusPlus::seed_from_u64(self.rng.random()),
                 sample_config: self.config.sample_config,
-                preserve_rotations: self.config.preserve_rotations,
+                locked_items: self.locked_items.clone(),
             };
         });
         debug!("[SEP] changed strip width to {:.3}", new_width);

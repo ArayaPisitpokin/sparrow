@@ -59,7 +59,7 @@ pub fn compression_phase(
         total_moves: sep.cum_moves,
         total_evals: sep.cum_evals,
         n_shrinks: n_successes,
-        grouped_active: sep.config.preserve_rotations,
+        grouped_active: sep.locked_items.is_some(),
         phase_secs: start.elapsed().as_secs_f32(),
         ..SearchStats::default()
     };

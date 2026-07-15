@@ -86,7 +86,7 @@ fn main() -> Result<()> {
                 s.spawn(move |_| {
                     let mut next_rng = || Xoshiro256PlusPlus::seed_from_u64(rng.next_u64());
                     let builder = LBFBuilder::new(instance.clone(), next_rng(), LBF_SAMPLE_CONFIG).construct();
-                    let mut expl_separator = Separator::new(builder.instance, builder.prob, next_rng(), config.expl_cfg.separator_config);
+                    let mut expl_separator = Separator::new(builder.instance, builder.prob, next_rng(), config.expl_cfg.separator_config, None);
 
                     terminator.new_timeout(config.expl_cfg.time_limit);
                     let solutions = exploration_phase(&instance, &mut expl_separator, &mut DummySolListener, &terminator, &config.expl_cfg, None);
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
                     let start_comp = Instant::now();
 
                     terminator.new_timeout(config.cmpr_cfg.time_limit);
-                    let mut cmpr_separator = Separator::new(expl_separator.instance, expl_separator.prob, next_rng(), config.cmpr_cfg.separator_config);
+                    let mut cmpr_separator = Separator::new(expl_separator.instance, expl_separator.prob, next_rng(), config.cmpr_cfg.separator_config, None);
                     let cmpr_sol = compression_phase(&instance, &mut cmpr_separator, final_explore_sol, &mut DummySolListener, &terminator, &config.cmpr_cfg);
 
                     println!("[BENCH] [id:{:>3}] finished, expl: {:.3}% ({}s), cmpr: {:.3}% (+{:.3}%) ({}s)",
