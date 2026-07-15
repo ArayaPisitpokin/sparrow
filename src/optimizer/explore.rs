@@ -82,8 +82,9 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             // (right after a proven-feasible width, where repair is cheapest) —
             // not only at stalls, where the layout is at its tightest.
             if let Some(spec) = grouped {
-                let in_window = phase_start.elapsed().as_secs_f32()
-                    < spec.flip.window * config.time_limit.as_secs_f32();
+                let in_window = spec.flip.window >= 1.0
+                    || phase_start.elapsed().as_secs_f32()
+                        < spec.flip.window * config.time_limit.as_secs_f32();
                 if in_window && sep.rng.random::<f32>() < spec.flip.p_flip
                     && disrupt_by_group_flip(sep, spec, &mut stats)
                 {
@@ -124,8 +125,9 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             stats.n_disruptions += 1;
             let flipped = match grouped {
                 Some(spec)
-                    if phase_start.elapsed().as_secs_f32()
-                        < spec.flip.window * config.time_limit.as_secs_f32()
+                    if (spec.flip.window >= 1.0
+                        || phase_start.elapsed().as_secs_f32()
+                            < spec.flip.window * config.time_limit.as_secs_f32())
                         && sep.rng.random::<f32>() < spec.flip.p_flip =>
                 {
                     disrupt_by_group_flip(sep, spec, &mut stats)
@@ -369,9 +371,21 @@ fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) {
     let dt1_old = pi1.d_transf;
     let dt2_old = pi2.d_transf;
 
-    // Make sure the swaps do not violate feasibility (rotation).
-    let dt1_new = convert_sample_to_closest_feasible(dt2_old, sep.prob.instance.item(pi1.item_id));
-    let dt2_new = convert_sample_to_closest_feasible(dt1_old, sep.prob.instance.item(pi2.item_id));
+    // Make sure the swaps do not violate feasibility (rotation). Grouped-orientation
+    // locked items must keep their OWN rotation (only whole-garment flips may change
+    // it): they exchange translations only. Unlocked items behave as upstream.
+    let locked_items = sep.locked_items.clone();
+    let is_locked = move |item_id: usize| {
+        locked_items.as_deref().is_some_and(|l| l[item_id])
+    };
+    let dt1_new = match is_locked(pi1.item_id) {
+        true => DTransformation::new(dt1_old.rotation(), dt2_old.translation()),
+        false => convert_sample_to_closest_feasible(dt2_old, sep.prob.instance.item(pi1.item_id)),
+    };
+    let dt2_new = match is_locked(pi2.item_id) {
+        true => DTransformation::new(dt2_old.rotation(), dt1_old.translation()),
+        false => convert_sample_to_closest_feasible(dt1_old, sep.prob.instance.item(pi2.item_id)),
+    };
 
     info!("[EXPL] disrupting by swapping two large items (id: {} <-> {})", pi1.item_id, pi2.item_id);
 
@@ -390,14 +404,18 @@ fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) {
 
         for c1_pk in practically_contained_items(&sep.prob.layout, pk1).into_iter().filter(|c1_pk| *c1_pk != pk2) {
             let c1_pi = &sep.prob.layout.placed_items[c1_pk];
+            let own_rotation = c1_pi.d_transf.rotation();
 
             let new_dt = c1_pi.d_transf
                 .compose()
                 .transform(&converting_transformation)
                 .decompose();
 
-            //Ensure the sure the new position is feasible
-            let new_feasible_dt = convert_sample_to_closest_feasible(new_dt, sep.prob.instance.item(c1_pi.item_id));
+            //Ensure the sure the new position is feasible (locked items keep their rotation)
+            let new_feasible_dt = match is_locked(c1_pi.item_id) {
+                true => DTransformation::new(own_rotation, new_dt.translation()),
+                false => convert_sample_to_closest_feasible(new_dt, sep.prob.instance.item(c1_pi.item_id)),
+            };
             sep.move_item(c1_pk, new_feasible_dt);
         }
     }
@@ -409,13 +427,17 @@ fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) {
 
         for c2_pk in practically_contained_items(&sep.prob.layout, pk2).into_iter().filter(|c2_pk| *c2_pk != pk1) {
             let c2_pi = &sep.prob.layout.placed_items[c2_pk];
+            let own_rotation = c2_pi.d_transf.rotation();
             let new_dt = c2_pi.d_transf
                 .compose()
                 .transform(&converting_transformation)
                 .decompose();
 
-            //make sure the new position is feasible
-            let new_feasible_dt = convert_sample_to_closest_feasible(new_dt, sep.prob.instance.item(c2_pi.item_id));
+            //make sure the new position is feasible (locked items keep their rotation)
+            let new_feasible_dt = match is_locked(c2_pi.item_id) {
+                true => DTransformation::new(own_rotation, new_dt.translation()),
+                false => convert_sample_to_closest_feasible(new_dt, sep.prob.instance.item(c2_pi.item_id)),
+            };
             sep.move_item(c2_pk, new_feasible_dt);
         }
     }
