@@ -25,6 +25,10 @@ pub struct SeparatorConfig {
     pub n_workers: usize,
     pub log_level: Level,
     pub sample_config: SampleConfig,
+    /// When true, every regular move keeps the moved copy's current rotation
+    /// (grouped-orientation mode). Must be set iff a `GroupedOrientationSpec` is
+    /// passed to `optimize()`.
+    pub preserve_rotations: bool,
 }
 
 pub struct Separator {
@@ -35,6 +39,11 @@ pub struct Separator {
     pub workers: Vec<SeparatorWorker>,
     pub config: SeparatorConfig,
     pub thread_pool: Option<ThreadPool>,
+    /// Cumulative counters over this separator's lifetime (one optimization phase).
+    /// Plain integers, only touched once per `separate()` call on the master thread.
+    pub cum_separate_calls: u64,
+    pub cum_moves: u64,
+    pub cum_evals: u64,
 }
 
 impl Separator {
@@ -47,6 +56,7 @@ impl Separator {
                 ct: ct.clone(),
                 rng: Xoshiro256PlusPlus::seed_from_u64(rng.random()),
                 sample_config: config.sample_config,
+                preserve_rotations: config.preserve_rotations,
             }).collect();
 
         let pool = if cfg!(target_arch = "wasm32") {
@@ -65,6 +75,9 @@ impl Separator {
             workers,
             config,
             thread_pool: pool,
+            cum_separate_calls: 0,
+            cum_moves: 0,
+            cum_evals: 0,
         }
     }
 
@@ -129,6 +142,10 @@ impl Separator {
             self.rollback(&min_loss_sol.0, Some(&min_loss_sol.1));
         }
         let secs = start.elapsed().as_secs_f32();
+        // Cumulative phase stats (master thread; once per separate() call).
+        self.cum_separate_calls += 1;
+        self.cum_moves += sep_stats.total_moves as u64;
+        self.cum_evals += sep_stats.total_evals as u64;
         log!(self.config.log_level, "[SEP] finished, evals/s: {} K, evals/move: {}, moves/s: {}, iter/s: {}, #workers: {}, total {:.3}s",
             (sep_stats.total_evals as f32/ (1000.0 * secs)) as usize,
             FMT().fmt2(sep_stats.total_evals as f32 / sep_stats.total_moves as f32),
@@ -250,6 +267,7 @@ impl Separator {
                 ct: self.ct.clone(),
                 rng: Xoshiro256PlusPlus::seed_from_u64(self.rng.random()),
                 sample_config: self.config.sample_config,
+                preserve_rotations: self.config.preserve_rotations,
             };
         });
         debug!("[SEP] changed strip width to {:.3}", new_width);

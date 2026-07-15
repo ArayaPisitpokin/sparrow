@@ -1,7 +1,8 @@
 use crate::config::ExplorationConfig;
+use crate::grouped::GroupedOrientationSpec;
 use crate::optimizer::separator::{Separator, SeparatorConfig};
 use crate::sample::uniform_sampler::convert_sample_to_closest_feasible;
-use crate::util::listener::{ReportType, SolutionListener};
+use crate::util::listener::{ReportType, SearchStats, SolutionListener, StatsPhase};
 use crate::util::terminator::Terminator;
 use crate::FMT;
 use float_cmp::approx_eq;
@@ -18,7 +19,11 @@ use slotmap::SecondaryMap;
 use std::cmp::Reverse;
 
 /// Algorithm 12 from https://doi.org/10.48550/arXiv.2509.13329
-pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listener: &mut impl SolutionListener, term: &impl Terminator, config: &ExplorationConfig) -> Vec<SPSolution> {
+///
+/// `grouped`: optional grouped-orientation spec. When present, disruption events may
+/// flip whole garment groups (see `crate::grouped`); when `None`, behavior is
+/// identical to upstream.
+pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listener: &mut impl SolutionListener, term: &impl Terminator, config: &ExplorationConfig, grouped: Option<&GroupedOrientationSpec>) -> Vec<SPSolution> {
     let mut current_width = sep.prob.strip_width();
     let mut best_width = current_width;
 
@@ -29,10 +34,26 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
 
     let mut infeas_sol_pool: Vec<(SPSolution, f32)> = vec![];
 
+    // Phase statistics: plain integers on this (master) thread; reported once at phase end.
+    let mut stats = SearchStats { grouped_active: grouped.is_some(), ..SearchStats::default() };
+    let phase_start = jagua_rs::Instant::now();
+    // What the previous disruption was, to attribute the following separation outcome.
+    let mut last_disruption: Option<DisruptionKind> = None;
+
     while !term.kill() {
         // Attempt to separate the current layout
         let local_best = sep.separate(term, sol_listener);
         let total_loss = local_best.1.get_total_loss();
+
+        // Attribute this separation's outcome to the disruption that preceded it.
+        if let Some(kind) = last_disruption.take() {
+            if total_loss == 0.0 {
+                match kind {
+                    DisruptionKind::Swap => stats.post_swap_sep_success += 1,
+                    DisruptionKind::Flip => stats.post_flip_sep_success += 1,
+                }
+            }
+        }
 
         if total_loss == 0.0 {
             // If successfully separated
@@ -48,6 +69,7 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             sep.change_strip_width(next_width, None);
             current_width = next_width;
             infeas_sol_pool.clear();
+            stats.n_shrinks += 1;
         } else {
             info!("[EXPL] unable to reach feasibility (width: {:.3}, dens: {:.3}%, min loss: {:.3})", current_width, sep.prob.density() * 100.0, FMT().fmt2(total_loss));
             sol_listener.report(ReportType::ExplInfeas, &local_best.0, instance);
@@ -77,13 +99,32 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
 
             // Rollback to this solution and disrupt it.
             sep.rollback(selected_sol, None);
+            stats.n_disruptions += 1;
+            // Group flips are wired here in a later phase; today every disruption is a swap.
             disrupt_solution(sep, config);
+            stats.n_swaps += 1;
+            last_disruption = Some(DisruptionKind::Swap);
         }
     }
 
     info!("[EXPL] finished, best feasible solution: width: {:.3} ({:.3}%)",best_width,feasible_sols.last().unwrap().density(instance) * 100.0);
 
+    // Assemble and emit phase statistics (2nd-to-none hot-path cost: this runs once).
+    stats.n_separate_calls = sep.cum_separate_calls;
+    stats.total_moves = sep.cum_moves;
+    stats.total_evals = sep.cum_evals;
+    stats.phase_secs = phase_start.elapsed().as_secs_f32();
+    sol_listener.on_search_stats(StatsPhase::Exploration, &stats);
+
     feasible_sols
+}
+
+/// Which kind of disruption was applied (for outcome attribution in `SearchStats`).
+#[derive(Debug, Clone, Copy)]
+enum DisruptionKind {
+    Swap,
+    #[allow(dead_code)] // constructed once the group-flip move lands (phase 5)
+    Flip,
 }
 
 fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) {

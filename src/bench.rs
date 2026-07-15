@@ -89,7 +89,7 @@ fn main() -> Result<()> {
                     let mut expl_separator = Separator::new(builder.instance, builder.prob, next_rng(), config.expl_cfg.separator_config);
 
                     terminator.new_timeout(config.expl_cfg.time_limit);
-                    let solutions = exploration_phase(&instance, &mut expl_separator, &mut DummySolListener, &terminator, &config.expl_cfg);
+                    let solutions = exploration_phase(&instance, &mut expl_separator, &mut DummySolListener, &terminator, &config.expl_cfg, None);
                     let final_explore_sol = solutions.last().expect("no solutions found during exploration");
 
                     let start_comp = Instant::now();

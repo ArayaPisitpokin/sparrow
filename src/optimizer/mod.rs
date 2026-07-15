@@ -1,5 +1,6 @@
 use crate::config::*;
 use crate::consts::LBF_SAMPLE_CONFIG;
+use crate::grouped::GroupedOrientationSpec;
 use crate::optimizer::compress::compression_phase;
 use crate::optimizer::explore::exploration_phase;
 use crate::optimizer::lbf::LBFBuilder;
@@ -19,6 +20,11 @@ pub mod explore;
 pub mod compress;
 
 ///Algorithm 11 from https://doi.org/10.48550/arXiv.2509.13329
+///
+/// `grouped`: optional grouped-orientation spec (see `crate::grouped`). Requires
+/// `preserve_rotations` set in both phases' separator configs, and an
+/// `initial_solution` encoding a valid orientation partition (free LBF construction
+/// cannot honor the group invariant). `None` = upstream behavior.
 pub fn optimize(
     instance: SPInstance,
     mut rng: Xoshiro256PlusPlus,
@@ -26,10 +32,25 @@ pub fn optimize(
     terminator: &mut impl Terminator,
     expl_config: &ExplorationConfig,
     cmpr_config: &CompressionConfig,
-    initial_solution: Option<&SPSolution>
+    initial_solution: Option<&SPSolution>,
+    grouped: Option<&GroupedOrientationSpec>,
 ) -> SPSolution {
     let mut next_rng = || Xoshiro256PlusPlus::seed_from_u64(rng.next_u64());
-    
+
+    if let Some(spec) = grouped {
+        spec.validate(&instance)
+            .unwrap_or_else(|e| panic!("[OPT] invalid GroupedOrientationSpec: {e}"));
+        assert!(
+            expl_config.separator_config.preserve_rotations
+                && cmpr_config.separator_config.preserve_rotations,
+            "[OPT] grouped-orientation mode requires preserve_rotations in both separator configs"
+        );
+        assert!(
+            initial_solution.is_some(),
+            "[OPT] grouped-orientation mode requires an initial solution encoding a valid partition"
+        );
+    }
+
     // First build an initial solution if none is provided
     let start_prob = match initial_solution {
         None => {
@@ -53,6 +74,7 @@ pub fn optimize(
         sol_listener,
         terminator,
         expl_config,
+        grouped,
     );
     let final_explore_sol = solutions.last().unwrap().clone();
 

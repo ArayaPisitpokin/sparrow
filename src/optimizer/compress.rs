@@ -1,6 +1,6 @@
 use crate::config::{CompressionConfig, ShrinkDecayStrategy};
 use crate::optimizer::separator::Separator;
-use crate::util::listener::{ReportType, SolutionListener};
+use crate::util::listener::{ReportType, SearchStats, SolutionListener, StatsPhase};
 use crate::util::terminator::Terminator;
 use jagua_rs::probs::spp::entities::{SPInstance, SPSolution};
 use jagua_rs::Instant;
@@ -19,6 +19,7 @@ pub fn compression_phase(
     let mut best_sol = init_sol.clone();
     let start = Instant::now();
     let mut n_failed_attempts = 0;
+    let mut n_successes: u64 = 0;
 
     // Create the function to calculate the shrink step size.
     let shrink_step_size = |n_failed_attempts: i32| -> f32 {
@@ -42,6 +43,7 @@ pub fn compression_phase(
                 info!("[CMPR] success at {:.3}% ({:.3} | {:.3}%)", step * 100.0, compacted_sol.strip_width(), compacted_sol.density(instance) * 100.0);
                 sol_listener.report(ReportType::CmprFeas, &compacted_sol, instance);
                 best_sol = compacted_sol;
+                n_successes += 1;
             }
             None => {
                 info!("[CMPR] failed at {:.3}%", step * 100.0);
@@ -50,6 +52,19 @@ pub fn compression_phase(
         }
     }
     info!("[CMPR] finished, compressed from {:.3}% to {:.3}% (+{:.3}%)", init_sol.density(instance) * 100.0, best_sol.density(instance) * 100.0, (best_sol.density(instance) - init_sol.density(instance)) * 100.0);
+
+    // Assemble and emit phase statistics (runs once, at phase end).
+    let stats = SearchStats {
+        n_separate_calls: sep.cum_separate_calls,
+        total_moves: sep.cum_moves,
+        total_evals: sep.cum_evals,
+        n_shrinks: n_successes,
+        grouped_active: sep.config.preserve_rotations,
+        phase_secs: start.elapsed().as_secs_f32(),
+        ..SearchStats::default()
+    };
+    sol_listener.on_search_stats(StatsPhase::Compression, &stats);
+
     best_sol
 }
 

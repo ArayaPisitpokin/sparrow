@@ -115,7 +115,8 @@ fn main() -> Result<()>{
         &mut ctrlc_terminator,
         &config.expl_cfg,
         &config.cmpr_cfg,
-        initial_solution.as_ref()
+        initial_solution.as_ref(),
+        None,
     );
 
     let json_path = format!("{OUTPUT_DIR}/final_{}.json", ext_instance.name);

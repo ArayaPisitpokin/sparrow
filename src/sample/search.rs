@@ -17,7 +17,10 @@ pub struct SampleConfig {
 }
 
 /// Algorithm 6 and Figure 7 from https://doi.org/10.48550/arXiv.2509.13329
-pub fn search_placement(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, mut evaluator: impl SampleEvaluator, sample_config: SampleConfig, rng: &mut impl Rng) -> (Option<(DTransformation, SampleEval)>, usize) {
+///
+/// `rot_lock`: when `Some(r)`, all generated samples keep rotation `r`
+/// (grouped-orientation mode). `None` reproduces upstream behavior exactly.
+pub fn search_placement(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, mut evaluator: impl SampleEvaluator, sample_config: SampleConfig, rng: &mut impl Rng, rot_lock: Option<f32>) -> (Option<(DTransformation, SampleEval)>, usize) {
     let item_min_dim = f32::min(item.shape_cd.bbox.width(), item.shape_cd.bbox.height());
 
     let mut best_samples = BestSamples::new(sample_config.n_coord_descents, item_min_dim * UNIQUE_SAMPLE_THRESHOLD);
@@ -34,11 +37,11 @@ pub fn search_placement(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, mut e
 
             //Create a uniform sampler focussed around the current placement
             let pi_bbox = l.placed_items[ref_pk].shape.bbox;
-            UniformBBoxSampler::new(pi_bbox, item, l.container.outer_cd.bbox)
+            UniformBBoxSampler::new(pi_bbox, item, l.container.outer_cd.bbox, rot_lock)
         }
         None => None,
     };
-    let container_sampler = UniformBBoxSampler::new(l.container.outer_cd.bbox, item, l.container.outer_cd.bbox);
+    let container_sampler = UniformBBoxSampler::new(l.container.outer_cd.bbox, item, l.container.outer_cd.bbox, rot_lock);
 
     //Perform the focussed sampling
     if let Some(focussed_sampler) = focussed_sampler {

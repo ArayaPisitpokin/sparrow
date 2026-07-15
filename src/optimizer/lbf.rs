@@ -82,7 +82,7 @@ impl LBFBuilder {
         let item = self.instance.item(item_id);
         let evaluator = LBFEvaluator::new(layout, item);
 
-        let (best_sample, _) = search_placement(layout, item, None, evaluator, self.sample_config, &mut self.rng);
+        let (best_sample, _) = search_placement(layout, item, None, evaluator, self.sample_config, &mut self.rng, None);
 
         match best_sample {
             Some((d_transf, SampleEval::Clear { .. })) => {

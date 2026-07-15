@@ -6,6 +6,7 @@ use jagua_rs::Instant;
 use numfmt::{Formatter, Precision, Scales};
 use std::sync::LazyLock;
 
+pub mod grouped;
 pub mod optimizer;
 pub mod quantify;
 pub mod sample;

@@ -27,17 +27,27 @@ struct RotEntry {
 }
 
 impl UniformBBoxSampler {
-    pub fn new(sample_bbox: Rect, item: &Item, container_bbox: Rect) -> Option<Self> {
-        let rotations = match &item.allowed_rotation {
-            RotationRange::None => &vec![0.0],
-            RotationRange::Discrete(r) => r,
-            RotationRange::Continuous => {
-                // for continuous rotation, we sample a set of rotations spaced evenly
-                let step = (2.0 * PI) / ROT_N_SAMPLES as f32;
-                &(0..ROT_N_SAMPLES)
-                    .map(|i| i as f32 * step)
-                    .collect_vec()
+    /// `rot_override`: when `Some(r)`, the sampler only generates samples at rotation `r`
+    /// (grouped-orientation mode: a moving copy must keep its current rotation).
+    /// `None` reproduces the upstream behavior exactly.
+    pub fn new(sample_bbox: Rect, item: &Item, container_bbox: Rect, rot_override: Option<f32>) -> Option<Self> {
+        let locked;
+        let rotations = match rot_override {
+            Some(r) => {
+                locked = vec![r];
+                &locked
             }
+            None => match &item.allowed_rotation {
+                RotationRange::None => &vec![0.0],
+                RotationRange::Discrete(r) => r,
+                RotationRange::Continuous => {
+                    // for continuous rotation, we sample a set of rotations spaced evenly
+                    let step = (2.0 * PI) / ROT_N_SAMPLES as f32;
+                    &(0..ROT_N_SAMPLES)
+                        .map(|i| i as f32 * step)
+                        .collect_vec()
+                }
+            },
         };
 
         let mut shape_buffer = item.shape_cd.as_ref().clone();
