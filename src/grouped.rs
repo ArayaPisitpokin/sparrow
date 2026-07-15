@@ -37,11 +37,17 @@ pub struct OrientationGroup {
 /// Tuning knobs for the group-flip disruption.
 #[derive(Debug, Clone, Copy)]
 pub struct GroupFlipConfig {
-    /// Probability that a disruption event is a group flip instead of the
-    /// swap-two-large-items move. `0.0` disables flips entirely (strict `<` compare).
+    /// Probability that a flip fires — at a disruption event (instead of the
+    /// swap-two-large-items move) and, proactively, after each successful strip
+    /// shrink while the layout is still plastic. `0.0` disables flips entirely
+    /// (strict `<` compare).
     pub p_flip: f32,
     /// Number of garments flipped per flip event.
     pub n_garments_per_flip: usize,
+    /// Fraction of the exploration time limit during which flips may fire (both
+    /// triggers). After the window closes, orientations are frozen and the
+    /// remaining budget refines the winning partition. `1.0` = no gate.
+    pub window: f32,
 }
 
 impl GroupedOrientationSpec {
@@ -50,6 +56,9 @@ impl GroupedOrientationSpec {
     pub fn validate(&self, instance: &SPInstance) -> Result<(), String> {
         if !(0.0..=1.0).contains(&self.flip.p_flip) {
             return Err(format!("p_flip must be in [0, 1], got {}", self.flip.p_flip));
+        }
+        if !(0.0..=1.0).contains(&self.flip.window) {
+            return Err(format!("flip window must be in [0, 1], got {}", self.flip.window));
         }
         if self.flip.n_garments_per_flip == 0 {
             return Err("n_garments_per_flip must be >= 1".to_string());

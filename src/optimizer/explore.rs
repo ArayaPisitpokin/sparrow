@@ -78,6 +78,19 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             current_width = next_width;
             infeas_sol_pool.clear();
             stats.n_shrinks += 1;
+            // Proactive flip: partition moves are made while the layout is plastic
+            // (right after a proven-feasible width, where repair is cheapest) —
+            // not only at stalls, where the layout is at its tightest.
+            if let Some(spec) = grouped {
+                let in_window = phase_start.elapsed().as_secs_f32()
+                    < spec.flip.window * config.time_limit.as_secs_f32();
+                if in_window && sep.rng.random::<f32>() < spec.flip.p_flip
+                    && disrupt_by_group_flip(sep, spec, &mut stats)
+                {
+                    stats.n_disruptions += 1;
+                    last_disruption = Some(DisruptionKind::Flip);
+                }
+            }
         } else {
             info!("[EXPL] unable to reach feasibility (width: {:.3}, dens: {:.3}%, min loss: {:.3})", current_width, sep.prob.density() * 100.0, FMT().fmt2(total_loss));
             sol_listener.report(ReportType::ExplInfeas, &local_best.0, instance);
@@ -110,7 +123,11 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             sep.rollback(selected_sol, None);
             stats.n_disruptions += 1;
             let flipped = match grouped {
-                Some(spec) if sep.rng.random::<f32>() < spec.flip.p_flip => {
+                Some(spec)
+                    if phase_start.elapsed().as_secs_f32()
+                        < spec.flip.window * config.time_limit.as_secs_f32()
+                        && sep.rng.random::<f32>() < spec.flip.p_flip =>
+                {
                     disrupt_by_group_flip(sep, spec, &mut stats)
                 }
                 _ => false,
