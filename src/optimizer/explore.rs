@@ -47,6 +47,21 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
     let phase_start = jagua_rs::Instant::now();
     // What the previous disruption was, to attribute the following separation outcome.
     let mut last_disruption: Option<DisruptionKind> = None;
+    // Fork-at-swap: the swapped-only variant awaiting its own separation attempt
+    // (the flipped variant runs first; the pool ditches whichever loses).
+    let mut pending_fork: Option<SPSolution> = None;
+    // item_id -> group index, for locating the swapped piece's garment group.
+    let group_of: Vec<Option<usize>> = {
+        let mut v = vec![None; sep.instance.items.len()];
+        if let Some(spec) = grouped {
+            for (gi, g) in spec.groups.iter().enumerate() {
+                for &(id, _) in &g.members {
+                    v[id] = Some(gi);
+                }
+            }
+        }
+        v
+    };
 
     while !term.kill() {
         // Attempt to separate the current layout
@@ -77,6 +92,7 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             sep.change_strip_width(next_width, None);
             current_width = next_width;
             infeas_sol_pool.clear();
+            pending_fork = None; // stale: snapshot was taken at the pre-shrink width
             stats.n_shrinks += 1;
             // Proactive flip: partition moves are made while the layout is plastic
             // (right after a proven-feasible width, where repair is cheapest) —
@@ -104,6 +120,15 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             if infeas_sol_pool.len() >= config.max_conseq_failed_attempts.unwrap_or(usize::MAX) {
                 info!("[EXPL] max consecutive failed attempts ({}), terminating", infeas_sol_pool.len());
                 break;
+            }
+
+            // Fork-at-swap: the flipped variant just had its attempt (and failed —
+            // its local best entered the pool above); give the swapped-only
+            // variant its paired attempt before disrupting anything new.
+            if let Some(a_state) = pending_fork.take() {
+                sep.rollback(&a_state, None);
+                last_disruption = Some(DisruptionKind::Swap);
+                continue;
             }
 
             // Restore to a random solution from the pool, with better solutions having more chance to be selected
@@ -137,9 +162,32 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             if flipped {
                 last_disruption = Some(DisruptionKind::Flip);
             } else {
-                disrupt_solution(sep, config);
+                let swapped = disrupt_solution(sep, config);
                 stats.n_swaps += 1;
                 last_disruption = Some(DisruptionKind::Swap);
+                // Fork-at-swap: flip the garment containing a swapped piece (variant
+                // B, live), keeping the swapped-only state (variant A) for a paired
+                // attempt. The orientation decision rides geometry that is already
+                // being torn up and repaired.
+                if let (Some(spec), Some((pk1, pk2))) = (grouped, swapped) {
+                    let in_window = spec.flip.window >= 1.0
+                        || phase_start.elapsed().as_secs_f32()
+                            < spec.flip.window * config.time_limit.as_secs_f32();
+                    if spec.flip.fork_at_swap && in_window {
+                        for pk in [pk1, pk2] {
+                            let pi = &sep.prob.layout.placed_items[pk];
+                            let Some(gi) = group_of[pi.item_id] else { continue };
+                            let src180 = crate::grouped::is_dir_180(pi.d_transf.rotation());
+                            let c = pi.shape.centroid();
+                            let a_state = sep.prob.save();
+                            if flip_garment_at(sep, spec, gi, src180, (c.0, c.1), &mut stats) {
+                                pending_fork = Some(a_state);
+                                last_disruption = Some(DisruptionKind::Flip);
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -241,6 +289,31 @@ fn flip_one_garment(
         return false;
     };
 
+    flip_garment_at(sep, spec, gi, src180, anchor, stats)
+}
+
+/// Flips one garment of group `gi` from direction `src180`, assembled from the
+/// per_garment source-direction copies of every member nearest to `anchor`.
+/// See `flip_one_garment` for the move semantics.
+fn flip_garment_at(
+    sep: &mut Separator,
+    spec: &crate::grouped::GroupedOrientationSpec,
+    gi: usize,
+    src180: bool,
+    anchor: (f32, f32),
+    stats: &mut SearchStats,
+) -> bool {
+    use crate::grouped::is_dir_180;
+    let group = &spec.groups[gi];
+
+    // Census of this group's members' copies (fresh: callers may have moved items).
+    let n_items = sep.instance.items.len();
+    let mut copies: Vec<Vec<(PItemKey, bool, (f32, f32))>> = vec![Vec::new(); n_items];
+    for (pk, pi) in sep.prob.layout.placed_items.iter() {
+        let c = pi.shape.centroid();
+        copies[pi.item_id].push((pk, is_dir_180(pi.d_transf.rotation()), (c.0, c.1)));
+    }
+
     // Select per_garment nearest source-direction copies of every member and
     // compute their flipped poses. No mutation until the whole garment resolves.
     let dist2 = |a: (f32, f32)| (a.0 - anchor.0).powi(2) + (a.1 - anchor.1).powi(2);
@@ -294,10 +367,10 @@ fn flip_one_garment(
     true
 }
 
-fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) {
+fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) -> Option<(PItemKey, PItemKey)> {
     if sep.prob.layout.placed_items.len() < 2 {
         warn!("[DSRP] cannot disrupt solution with less than 2 items");
-        return;
+        return None;
     }
 
     // The general idea is to disrupt a solution by swapping two 'large' items in the layout.
@@ -420,6 +493,8 @@ fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) {
         }
     }
 
+    let fork_keys = (pk1, pk2);
+
     // Do the same for the second item, but using the second transformation
     {
         let converting_transformation = dt2_new.compose().inverse()
@@ -441,6 +516,8 @@ fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) {
             sep.move_item(c2_pk, new_feasible_dt);
         }
     }
+
+    Some(fork_keys)
 }
 
 /// Collects all items which point of inaccessibility (POI) is contained by pk_c's shape.

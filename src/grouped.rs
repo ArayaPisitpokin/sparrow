@@ -48,6 +48,12 @@ pub struct GroupFlipConfig {
     /// triggers). After the window closes, orientations are frozen and the
     /// remaining budget refines the winning partition. `1.0` = no gate.
     pub window: f32,
+    /// Fork-at-swap mode: at each swap disruption, snapshot the swapped-only
+    /// state (variant A), additionally flip the garment containing the swapped
+    /// piece (variant B, the live state), and give each its own separation
+    /// attempt — the infeasible-solution pool ditches the loser. When set,
+    /// random/proactive flips are typically disabled (p_flip = 0).
+    pub fork_at_swap: bool,
 }
 
 impl GroupedOrientationSpec {
