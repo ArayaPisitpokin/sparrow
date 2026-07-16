@@ -72,7 +72,7 @@ pub(crate) fn orientation_resolve(
         .placed_items
         .iter()
         .filter(|(pk, _)| !cell_pk_set.contains(pk))
-        .map(|(_, pi)| pi.shape.as_ref())
+        .map(|(_, pi)| &pi.shape)
         .collect();
 
     let mut lin = vec![[0.0f32; 2]; g];
@@ -306,9 +306,9 @@ fn build_cells(sep: &Separator, spec: &GroupedOrientationSpec) -> Option<Vec<Gar
                     let mut flipped_shape = item.shape_cd.as_ref().clone();
                     flipped_shape.transform_from(item.shape_cd.as_ref(), &flipped.compose());
                     let (s0, s1, d0, d1) = if cur_is180 {
-                        (flipped_shape, pi.shape.as_ref().clone(), flipped, pi.d_transf)
+                        (flipped_shape, pi.shape.clone(), flipped, pi.d_transf)
                     } else {
-                        (pi.shape.as_ref().clone(), flipped_shape, pi.d_transf, flipped)
+                        (pi.shape.clone(), flipped_shape, pi.d_transf, flipped)
                     };
                     shapes.push([s0, s1]);
                     dts.push([d0, d1]);
