@@ -59,6 +59,16 @@ pub struct GroupFlipConfig {
     /// positions and flip to the exact optimum — a no-op when the current
     /// assignment is already optimal. See `optimizer::resolve`.
     pub resolve: bool,
+    /// Soft-anneal mode: pieces sample both orientations freely (no rotation
+    /// locks) while a growing penalty λ(t) is added to candidate poses whose
+    /// class disagrees with their garment's current majority. At the end of the
+    /// flip window the layout is projected onto full consistency (minority
+    /// pieces flipped in place), locks activate, and the remaining budget
+    /// refines the winning assignment. See `optimizer::anneal`.
+    pub anneal: bool,
+    /// Anneal penalty ceiling, as a fraction of a piece's own collision scale
+    /// (convex-hull area). λ ramps quadratically from 0 to this over the window.
+    pub anneal_lambda: f32,
 }
 
 impl GroupedOrientationSpec {
@@ -70,6 +80,15 @@ impl GroupedOrientationSpec {
         }
         if !(0.0..=1.0).contains(&self.flip.window) {
             return Err(format!("flip window must be in [0, 1], got {}", self.flip.window));
+        }
+        if self.flip.anneal_lambda < 0.0 {
+            return Err(format!(
+                "anneal_lambda must be >= 0, got {}",
+                self.flip.anneal_lambda
+            ));
+        }
+        if self.flip.anneal && (self.flip.resolve || self.flip.fork_at_swap) {
+            return Err("anneal mode is exclusive of resolve/fork modes".to_string());
         }
         if self.flip.n_garments_per_flip == 0 {
             return Err("n_garments_per_flip must be >= 1".to_string());

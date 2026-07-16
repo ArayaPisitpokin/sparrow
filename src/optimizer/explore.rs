@@ -50,6 +50,12 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
     // Fork-at-swap: the swapped-only variant awaiting its own separation attempt
     // (the flipped variant runs first; the pool ditches whichever loses).
     let mut pending_fork: Option<SPSolution> = None;
+    // Soft-anneal bookkeeping: whether the end-of-window projection has run, and
+    // the index in `feasible_sols` from which entries satisfy the group invariant
+    // (mid-anneal feasible layouts are mixed-orientation and must not be returned).
+    let anneal_mode = grouped.is_some_and(|s| s.flip.anneal);
+    let mut annealed = false;
+    let mut anneal_valid_from = 0usize;
     // item_id -> group index, for locating the swapped piece's garment group.
     let group_of: Vec<Option<usize>> = {
         let mut v = vec![None; sep.instance.items.len()];
@@ -64,6 +70,56 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
     };
 
     while !term.kill() {
+        // Soft-anneal: ramp the consistency pressure; at window close project the
+        // layout onto full consistency, activate the rotation locks, and secure a
+        // post-projection feasible incumbent (widening the strip if needed).
+        if let Some(spec) = grouped {
+            if anneal_mode && !annealed {
+                let window = spec.flip.window.min(0.9); // budget must remain post-projection
+                let frac = phase_start.elapsed().as_secs_f32()
+                    / config.time_limit.as_secs_f32().max(f32::EPSILON);
+                if frac < window {
+                    sep.anneal_lambda =
+                        spec.flip.anneal_lambda * (frac / window).powi(2);
+                } else {
+                    annealed = true;
+                    sep.anneal_lambda = 0.0;
+                    crate::optimizer::anneal::project_to_consistency(sep, spec, &mut stats);
+                    sep.locks_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                    infeas_sol_pool.clear();
+                    pending_fork = None;
+                    last_disruption = None;
+                    // secure a valid feasible incumbent (bounded widening)
+                    anneal_valid_from = feasible_sols.len();
+                    best_width = f32::INFINITY;
+                    for _ in 0..40 {
+                        let (sol, ct) = sep.separate(term, sol_listener);
+                        if ct.get_total_loss() == 0.0 {
+                            current_width = sep.prob.strip_width();
+                            best_width = current_width;
+                            sol_listener.report(ReportType::ExplFeas, &sol, instance);
+                            feasible_sols.push(sol);
+                            break;
+                        }
+                        if term.kill() {
+                            break;
+                        }
+                        let wider = sep.prob.strip_width() * 1.01;
+                        sep.change_strip_width(wider, None);
+                        current_width = wider;
+                    }
+                    if feasible_sols.len() == anneal_valid_from {
+                        // pathological budget: return the projected-but-overlapping
+                        // state; the consumer's feasibility guard rebuilds from it
+                        warn!("[ANNL] no post-projection feasible layout secured (budget exhausted)");
+                        feasible_sols.push(sep.prob.save());
+                    }
+                    info!("[ANNL] projection complete at width {:.3}", sep.prob.strip_width());
+                    continue;
+                }
+            }
+        }
+
         // Attempt to separate the current layout
         let local_best = sep.separate(term, sol_listener);
         let total_loss = local_best.1.get_total_loss();
@@ -200,6 +256,23 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
                 }
             }
         }
+    }
+
+    if anneal_mode {
+        if !annealed {
+            // Exploration ended before the window closed (very short budgets):
+            // project now and return the projected state; the consumer's guard
+            // handles residual overlap.
+            if let Some(spec) = grouped {
+                crate::optimizer::anneal::project_to_consistency(sep, spec, &mut stats);
+                sep.locks_active.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            anneal_valid_from = feasible_sols.len();
+            feasible_sols.push(sep.prob.save());
+        }
+        // entries [1, anneal_valid_from) are mid-anneal mixed layouts: drop them
+        // (index 0 is the seed, which satisfies the invariant by construction)
+        feasible_sols.drain(1..anneal_valid_from.max(1));
     }
 
     info!("[EXPL] finished, best feasible solution: width: {:.3} ({:.3}%)",best_width,feasible_sols.last().unwrap().density(instance) * 100.0);

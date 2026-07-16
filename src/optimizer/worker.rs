@@ -10,8 +10,11 @@ use jagua_rs::geometry::DTransformation;
 use jagua_rs::probs::spp::entities::{SPInstance, SPPlacement, SPProblem, SPSolution};
 use log::debug;
 use rand::prelude::SliceRandom;
+use crate::optimizer::anneal::AnnealMap;
+use crate::eval::sample_eval::SampleEval;
 use std::iter::Sum;
 use std::ops::AddAssign;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use rand::rngs::Xoshiro256PlusPlus;
 use tap::Tap;
@@ -24,21 +27,37 @@ pub struct SeparatorWorker {
     pub sample_config: SampleConfig,
     /// Grouped-orientation mode: per-item rotation locks (item_id -> locked).
     pub locked_items: Option<Arc<[bool]>>,
+    /// Whether the locks currently apply (false during an anneal window).
+    pub locks_active: Arc<AtomicBool>,
+    /// Anneal consistency-pressure map for this pass (None outside anneal).
+    pub anneal: Option<Arc<AnnealMap>>,
 }
 
 impl SeparatorWorker {
-    pub fn load(&mut self, sol: &SPSolution, ct: &CollisionTracker) {
+    pub fn load(&mut self, sol: &SPSolution, ct: &CollisionTracker, anneal: Option<Arc<AnnealMap>>) {
         // restores the state of the worker to the given solution and accompanying tracker
         debug_assert!(sol.strip_width() == self.prob.strip_width());
         self.prob.restore(sol);
         self.ct = ct.clone();
+        self.anneal = anneal;
     }
 
     /// Algorithm 5 from https://doi.org/10.48550/arXiv.2509.13329
+    ///
+    /// Anneal mode adds the consistency-disagreeing copies to the candidate set
+    /// (pressure must bind on collision-free pieces too) and biases every
+    /// candidate pose by the per-class anneal penalty.
     pub fn move_items(&mut self) -> SepStats {
-        // Collect all colliding items in a random order
+        // Collect all colliding items (plus anneal move-candidates) in a random order
         let candidates = self.prob.layout.placed_items.keys()
-            .filter(|pk| self.ct.get_loss(*pk) > 0.0)
+            .filter(|pk| {
+                self.ct.get_loss(*pk) > 0.0
+                    || self
+                        .anneal
+                        .as_ref()
+                        .and_then(|m| m.get(*pk))
+                        .is_some_and(|e| e.move_candidate)
+            })
             .collect_vec()
             .tap_mut(|v| v.shuffle(&mut self.rng));
 
@@ -47,16 +66,19 @@ impl SeparatorWorker {
 
         // Give each colliding item the opportunity to move to a better (eval) position
         for &pk in candidates.iter() {
-            // First check if the item is still colliding
-            if self.ct.get_loss(pk) > 0.0 {
+            let anneal_entry = self.anneal.as_ref().and_then(|m| m.get(pk)).copied();
+            // First check if the item is still colliding (or under anneal pressure)
+            if self.ct.get_loss(pk) > 0.0 || anneal_entry.is_some_and(|e| e.move_candidate) {
                 let item_id = self.prob.layout.placed_items[pk].item_id;
                 let item = self.instance.item(item_id);
 
-                // Grouped-orientation mode: locked items keep their current rotation.
-                // (one Option check + one slice index per move; resolved before the
-                // ~10^3 sample evaluations below)
+                // Grouped-orientation mode: locked items keep their current rotation
+                // once locks are active (inactive during an anneal window). One
+                // Option check + one slice index + one relaxed atomic load per move.
                 let rot_lock = match self.locked_items.as_deref() {
-                    Some(locked) if locked[item_id] => {
+                    Some(locked)
+                        if locked[item_id] && self.locks_active.load(Ordering::Relaxed) =>
+                    {
                         Some(self.prob.layout.placed_items[pk].d_transf.rotation())
                     }
                     _ => None,
@@ -65,9 +87,15 @@ impl SeparatorWorker {
                 // Create an 'evaluator' to perform collision detection and collision quantification of the samples during the search
                 let evaluator = SeparationEvaluator::new(&self.prob.layout, item, pk, &self.ct);
 
-                // Perform the search for a better position for the item
-                let (best_sample, n_evals) =
-                    search::search_placement(&self.prob.layout, item, Some(pk), evaluator, self.sample_config, &mut self.rng, rot_lock);
+                // Perform the search for a better position for the item; anneal
+                // pressure biases each candidate pose by its class penalty.
+                let (best_sample, n_evals) = match anneal_entry {
+                    Some(e) if e.penalty != [0.0; 2] => {
+                        let wrapped = AnnealEval { inner: evaluator, penalty: e.penalty };
+                        search::search_placement(&self.prob.layout, item, Some(pk), wrapped, self.sample_config, &mut self.rng, rot_lock)
+                    }
+                    _ => search::search_placement(&self.prob.layout, item, Some(pk), evaluator, self.sample_config, &mut self.rng, rot_lock),
+                };
 
                 let (new_dt, _eval) = best_sample.expect("search_placement should always return a sample");
 
@@ -87,8 +115,8 @@ impl SeparatorWorker {
 
         let (old_l, old_w_l) = (self.ct.get_loss(pk), self.ct.get_weighted_loss(pk));
 
-        debug_assert!(old_l > 0.0, "Item with key {:?} should be colliding, but has no loss: {}", pk, FMT().fmt2(old_l));
-        debug_assert!(old_w_l > 0.0, "Item with key {:?} should be colliding, but has no weighted loss: {}", pk, FMT().fmt2(old_w_l));
+        debug_assert!(old_l > 0.0 || self.anneal.is_some(), "Item with key {:?} should be colliding, but has no loss: {}", pk, FMT().fmt2(old_l));
+        debug_assert!(old_w_l > 0.0 || self.anneal.is_some(), "Item with key {:?} should be colliding, but has no weighted loss: {}", pk, FMT().fmt2(old_w_l));
 
         // First removing the item and subsequently place it in its new position
         let old_placement = self.prob.remove_item(pk);
@@ -101,10 +129,34 @@ impl SeparatorWorker {
         let (new_l, new_w_l) = (self.ct.get_loss(new_pk), self.ct.get_weighted_loss(new_pk));
 
         debug!("Moved {:?} (l: {}, wl: {}) to {:?} (l+1: {}, wl+1: {})", old_placement, FMT().fmt2(old_l), FMT().fmt2(old_w_l), new_placement, FMT().fmt2(new_l), FMT().fmt2(new_w_l));
-        debug_assert!(new_w_l <= old_w_l * 1.001, "weighted loss should never increase: {} > {}", FMT().fmt2(old_w_l), FMT().fmt2(new_w_l));
+        debug_assert!(new_w_l <= old_w_l * 1.001 || self.anneal.is_some(), "weighted loss should never increase: {} > {}", FMT().fmt2(old_w_l), FMT().fmt2(new_w_l));
         debug_assert!(tracker_matches_layout(&self.ct, &self.prob.layout));
 
         new_pk
+    }
+}
+
+/// Biases candidate-pose evaluations by a per-orientation-class penalty
+/// (anneal consistency pressure). Bound pass-through is conservative: penalties
+/// only add loss, so inner early-termination stays correct.
+pub struct AnnealEval<E: crate::eval::sample_eval::SampleEvaluator> {
+    pub inner: E,
+    pub penalty: [f32; 2],
+}
+
+impl<E: crate::eval::sample_eval::SampleEvaluator> crate::eval::sample_eval::SampleEvaluator
+    for AnnealEval<E>
+{
+    fn evaluate_sample(&mut self, dt: DTransformation, upper_bound: Option<SampleEval>) -> SampleEval {
+        let p = self.penalty[crate::grouped::is_dir_180(dt.rotation()) as usize];
+        match self.inner.evaluate_sample(dt, upper_bound) {
+            SampleEval::Clear { loss } => SampleEval::Clear { loss: loss + p },
+            SampleEval::Collision { loss } => SampleEval::Collision { loss: loss + p },
+            SampleEval::Invalid => SampleEval::Invalid,
+        }
+    }
+    fn n_evals(&self) -> usize {
+        self.inner.n_evals()
     }
 }
 

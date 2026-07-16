@@ -13,6 +13,7 @@ use rand::{Rng, SeedableRng};
 use std::time::Duration;
 use rand::rngs::Xoshiro256PlusPlus;
 
+pub mod anneal;
 pub mod lbf;
 pub mod resolve;
 pub mod separator;
@@ -48,17 +49,9 @@ pub fn optimize(
         );
     }
 
-    // Per-item rotation locks: group members are locked, everything else stays free
-    // (e.g. direction-free pieces keep both orientations). Built once per solve.
-    let locked_items: Option<std::sync::Arc<[bool]>> = grouped.map(|spec| {
-        let mut locked = vec![false; instance.items.len()];
-        for g in &spec.groups {
-            for &(item_id, _) in &g.members {
-                locked[item_id] = true;
-            }
-        }
-        locked.into()
-    });
+    // The separators own a copy of the spec: they derive per-item rotation locks
+    // (inactive during an anneal window) and drive the anneal penalty map.
+    let grouped_arc = grouped.map(|spec| std::sync::Arc::new(spec.clone()));
 
     // First build an initial solution if none is provided
     let start_prob = match initial_solution {
@@ -76,7 +69,7 @@ pub fn optimize(
 
     // Begin by executing the exploration phase
     terminator.new_timeout(expl_config.time_limit);
-    let mut expl_separator = Separator::new(instance.clone(), start_prob, next_rng(), expl_config.separator_config, locked_items.clone());
+    let mut expl_separator = Separator::new(instance.clone(), start_prob, next_rng(), expl_config.separator_config, grouped_arc.clone());
     let solutions = exploration_phase(
         &instance,
         &mut expl_separator,
@@ -89,7 +82,7 @@ pub fn optimize(
 
     // Start the compression phase from the final solution from the exploration phase
     terminator.new_timeout(cmpr_config.time_limit);
-    let mut cmpr_separator = Separator::new(expl_separator.instance, expl_separator.prob, next_rng(), cmpr_config.separator_config, locked_items);
+    let mut cmpr_separator = Separator::new(expl_separator.instance, expl_separator.prob, next_rng(), cmpr_config.separator_config, grouped_arc);
     let cmpr_sol = compression_phase(
         &instance,
         &mut cmpr_separator,

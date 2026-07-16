@@ -17,7 +17,10 @@ use rand::rngs::Xoshiro256PlusPlus;
 use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator;
 use rayon::ThreadPool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use crate::grouped::GroupedOrientationSpec;
+use crate::optimizer::anneal::{build_anneal_map, AnnealMap};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SeparatorConfig {
@@ -36,10 +39,18 @@ pub struct Separator {
     pub workers: Vec<SeparatorWorker>,
     pub config: SeparatorConfig,
     pub thread_pool: Option<ThreadPool>,
+    /// Grouped-orientation spec (drives locks, flips, resolve and anneal).
+    pub grouped: Option<Arc<GroupedOrientationSpec>>,
     /// Grouped-orientation mode: per-item rotation locks (item_id -> locked).
     /// `None` = upstream behavior. Group members are locked (regular moves keep the
     /// copy's rotation); ungrouped items (e.g. direction-free pieces) stay free.
     pub locked_items: Option<Arc<[bool]>>,
+    /// Whether the locks currently apply (false during an anneal window; the
+    /// exploration loop stores true at projection). One relaxed load per move.
+    pub locks_active: Arc<AtomicBool>,
+    /// Current anneal penalty ceiling λ(t)·unit-scale, set by the exploration
+    /// loop between separations; 0 disables the anneal map entirely.
+    pub anneal_lambda: f32,
     /// Cumulative counters over this separator's lifetime (one optimization phase).
     /// Plain integers, only touched once per `separate()` call on the master thread.
     pub cum_separate_calls: u64,
@@ -48,8 +59,22 @@ pub struct Separator {
 }
 
 impl Separator {
-    pub fn new(instance: SPInstance, prob: SPProblem, mut rng: Xoshiro256PlusPlus, config: SeparatorConfig, locked_items: Option<Arc<[bool]>>) -> Self {
+    pub fn new(instance: SPInstance, prob: SPProblem, mut rng: Xoshiro256PlusPlus, config: SeparatorConfig, grouped: Option<Arc<GroupedOrientationSpec>>) -> Self {
         let ct = CollisionTracker::new(&prob.layout);
+        let locked_items: Option<Arc<[bool]>> = grouped.as_ref().map(|spec| {
+            let mut locked = vec![false; instance.items.len()];
+            for g in &spec.groups {
+                for &(item_id, _) in &g.members {
+                    locked[item_id] = true;
+                }
+            }
+            locked.into()
+        });
+        // Locks are live from the start except in anneal mode, where they
+        // activate at the end-of-window projection.
+        let locks_active = Arc::new(AtomicBool::new(
+            grouped.as_ref().is_none_or(|s| !s.flip.anneal),
+        ));
         let workers = (0..config.n_workers).map(|_|
             SeparatorWorker {
                 instance: instance.clone(),
@@ -58,6 +83,8 @@ impl Separator {
                 rng: Xoshiro256PlusPlus::seed_from_u64(rng.random()),
                 sample_config: config.sample_config,
                 locked_items: locked_items.clone(),
+                locks_active: locks_active.clone(),
+                anneal: None,
             }).collect();
 
         let pool = if cfg!(target_arch = "wasm32") {
@@ -76,7 +103,10 @@ impl Separator {
             workers,
             config,
             thread_pool: pool,
+            grouped,
             locked_items,
+            locks_active,
+            anneal_lambda: 0.0,
             cum_separate_calls: 0,
             cum_moves: 0,
             cum_evals: 0,
@@ -107,7 +137,7 @@ impl Separator {
                 let (loss, w_loss) = (self.ct.get_total_loss(), self.ct.get_total_weighted_loss(),);
 
                 debug!("[SEP] [s:{n_strikes},i:{n_iter}] ( ) l: {} -> {}, wl: {} -> {}, (min l: {})", FMT().fmt2(loss_before), FMT().fmt2(loss), FMT().fmt2(w_loss_before), FMT().fmt2(w_loss), FMT().fmt2(min_loss));
-                debug_assert!(w_loss <= w_loss_before * 1.001, "weighted loss should not increase: {} -> {}", FMT().fmt2(w_loss), FMT().fmt2(w_loss_before));
+                debug_assert!(w_loss <= w_loss_before * 1.001 || self.anneal_lambda > 0.0, "weighted loss should not increase: {} -> {}", FMT().fmt2(w_loss), FMT().fmt2(w_loss_before));
 
                 if loss == 0.0 {
                     //All collisions are resolved
@@ -165,11 +195,21 @@ impl Separator {
     fn move_items_multi(&mut self) -> SepStats {
         let master_sol = self.prob.save();
 
+        // Anneal: rebuild the per-copy consistency-pressure map for the current
+        // geometry and λ (master thread, O(n log n) on ~10^2 pieces — negligible
+        // against the parallel move pass it precedes).
+        let anneal_map: Option<Arc<AnnealMap>> = match (&self.grouped, self.anneal_lambda) {
+            (Some(spec), l) if spec.flip.anneal && l > 0.0 => {
+                Some(Arc::new(build_anneal_map(self, spec, l)))
+            }
+            _ => None,
+        };
+
         // Define the parallel execution closure
         let mut separate_multi = || -> SepStats {
             self.workers.par_iter_mut().map(|worker| {
                 // Sync the workers with the master
-                worker.load(&master_sol, &self.ct);
+                worker.load(&master_sol, &self.ct, anneal_map.clone());
                 // Let all of them run `move_items` with unique random orderings in which the items are moved
                 worker.move_items()
             }).sum()
@@ -270,6 +310,8 @@ impl Separator {
                 rng: Xoshiro256PlusPlus::seed_from_u64(self.rng.random()),
                 sample_config: self.config.sample_config,
                 locked_items: self.locked_items.clone(),
+                locks_active: self.locks_active.clone(),
+                anneal: None,
             };
         });
         debug!("[SEP] changed strip width to {:.3}", new_width);
