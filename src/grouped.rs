@@ -54,6 +54,11 @@ pub struct GroupFlipConfig {
     /// attempt — the infeasible-solution pool ditches the loser. When set,
     /// random/proactive flips are typically disabled (p_flip = 0).
     pub fork_at_swap: bool,
+    /// Exact re-solve mode: after successful shrinks (and at stalls, before the
+    /// swap), enumerate every garment-orientation assignment at the current
+    /// positions and flip to the exact optimum — a no-op when the current
+    /// assignment is already optimal. See `optimizer::resolve`.
+    pub resolve: bool,
 }
 
 impl GroupedOrientationSpec {

@@ -39,6 +39,8 @@ pub struct SearchStats {
     pub n_swaps: u64,
     /// Disruptions that were group flips.
     pub n_flips: u64,
+    /// Orientation re-solve invocations (resolve mode; most are no-ops).
+    pub n_resolves: u64,
     /// Total garments flipped across all flip events.
     pub n_garments_flipped: u64,
     /// Sum of collision loss measured directly after each flip (repair burden proxy).

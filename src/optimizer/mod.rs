@@ -14,6 +14,7 @@ use std::time::Duration;
 use rand::rngs::Xoshiro256PlusPlus;
 
 pub mod lbf;
+pub mod resolve;
 pub mod separator;
 mod worker;
 pub mod explore;

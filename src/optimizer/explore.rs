@@ -94,18 +94,25 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             infeas_sol_pool.clear();
             pending_fork = None; // stale: snapshot was taken at the pre-shrink width
             stats.n_shrinks += 1;
-            // Proactive flip: partition moves are made while the layout is plastic
+            // Proactive orientation moves are made while the layout is plastic
             // (right after a proven-feasible width, where repair is cheapest) —
-            // not only at stalls, where the layout is at its tightest.
+            // not only at stalls, where the layout is at its tightest. Resolve
+            // mode re-solves exactly; flip mode flips a random garment w.p. p.
             if let Some(spec) = grouped {
                 let in_window = spec.flip.window >= 1.0
                     || phase_start.elapsed().as_secs_f32()
                         < spec.flip.window * config.time_limit.as_secs_f32();
-                if in_window && sep.rng.random::<f32>() < spec.flip.p_flip
-                    && disrupt_by_group_flip(sep, spec, &mut stats)
-                {
-                    stats.n_disruptions += 1;
-                    last_disruption = Some(DisruptionKind::Flip);
+                if in_window {
+                    let acted = if spec.flip.resolve {
+                        crate::optimizer::resolve::orientation_resolve(sep, spec, &mut stats)
+                    } else {
+                        sep.rng.random::<f32>() < spec.flip.p_flip
+                            && disrupt_by_group_flip(sep, spec, &mut stats)
+                    };
+                    if acted {
+                        stats.n_disruptions += 1;
+                        last_disruption = Some(DisruptionKind::Flip);
+                    }
                 }
             }
         } else {
@@ -148,13 +155,16 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             // with probability p_flip) or the swap-two-large-items move.
             sep.rollback(selected_sol, None);
             stats.n_disruptions += 1;
+            let in_window = grouped.is_some_and(|spec| {
+                spec.flip.window >= 1.0
+                    || phase_start.elapsed().as_secs_f32()
+                        < spec.flip.window * config.time_limit.as_secs_f32()
+            });
             let flipped = match grouped {
-                Some(spec)
-                    if (spec.flip.window >= 1.0
-                        || phase_start.elapsed().as_secs_f32()
-                            < spec.flip.window * config.time_limit.as_secs_f32())
-                        && sep.rng.random::<f32>() < spec.flip.p_flip =>
-                {
+                Some(spec) if in_window && spec.flip.resolve => {
+                    crate::optimizer::resolve::orientation_resolve(sep, spec, &mut stats)
+                }
+                Some(spec) if in_window && sep.rng.random::<f32>() < spec.flip.p_flip => {
                     disrupt_by_group_flip(sep, spec, &mut stats)
                 }
                 _ => false,
