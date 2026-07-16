@@ -83,6 +83,11 @@ pub fn optimize(
     // Start the compression phase from the final solution from the exploration phase
     terminator.new_timeout(cmpr_config.time_limit);
     let mut cmpr_separator = Separator::new(expl_separator.instance, expl_separator.prob, next_rng(), cmpr_config.separator_config, grouped_arc);
+    // Compression always refines a constraint-satisfying layout: rotation locks
+    // are unconditionally active (anneal projection has already run by now).
+    cmpr_separator
+        .locks_active
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let cmpr_sol = compression_phase(
         &instance,
         &mut cmpr_separator,
