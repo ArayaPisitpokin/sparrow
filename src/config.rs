@@ -1,5 +1,6 @@
 use crate::optimizer::separator::SeparatorConfig;
 use crate::sample::search::SampleConfig;
+use crate::small::SmallPieceConfig;
 use jagua_rs::collision_detection::CDEConfig;
 use jagua_rs::geometry::fail_fast::SPSurrogateConfig;
 use std::time::Duration;
@@ -33,7 +34,27 @@ pub struct ExplorationConfig {
     pub max_conseq_failed_attempts: Option<usize>,
     pub solution_pool_distribution_stddev: f32,
     pub separator_config: SeparatorConfig,
-    pub large_item_ch_area_cutoff_percentile: f32
+    pub large_item_ch_area_cutoff_percentile: f32,
+    /// Where the strip is cut when it shrinks: `false` = the strip centre (upstream),
+    /// `true` = a uniformly random position (as the compression phase does).
+    pub random_split: bool,
+    /// Proportional squeeze (2026-08-31): instead of cut-and-slide, every item's
+    /// x-position is scaled by new_width/old_width — the shrink damage becomes many
+    /// hairline overlaps spread over the whole strip and no item travels far.
+    /// Overrides `random_split` when set.
+    pub prop_shrink: bool,
+    /// Where the exploration cut lands (2026-08-31 cut-position experiment):
+    /// 0 = centre (upstream), 1 = uniformly random, 2 = fixed fraction `split_frac`
+    /// of the current width, 3 = sliding left->right over the phase's time limit
+    /// (starts at the left wall, ends at the right wall), 4 = sliding right->left.
+    /// `random_split = true` is equivalent to mode 1.
+    pub split_mode: u8,
+    pub split_frac: f32,
+    /// Window-ladder mode (2026-09-01): when set, exploration maximizes the exact
+    /// covered area of [0, window_x] mm (straddle credit at the line) instead of
+    /// minimizing strip width. Pressure = cut-and-slide with the cut inside the
+    /// window; repair unrestricted; a round is kept iff the window area grew.
+    pub window_x: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +63,11 @@ pub struct CompressionConfig {
     pub time_limit: Duration,
     pub shrink_decay: ShrinkDecayStrategy,
     pub separator_config: SeparatorConfig,
+    /// See `ExplorationConfig::prop_shrink`.
+    pub prop_shrink: bool,
+    /// Window-ladder mode: compression optimizes length and would trade window
+    /// density away, so it is skipped entirely.
+    pub window_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,9 +94,17 @@ pub const DEFAULT_SPARROW_CONFIG: SparrowConfig = SparrowConfig {
                 n_container_samples: 50,
                 n_focussed_samples: 25,
                 n_coord_descents: 3,
+                window_home: None,
             },
+            small: SmallPieceConfig::OFF,
+            freeze_x: None,
         },
-        large_item_ch_area_cutoff_percentile: 0.75
+        large_item_ch_area_cutoff_percentile: 0.75,
+        random_split: false,
+        prop_shrink: false,
+        split_mode: 0,
+        split_frac: 0.5,
+        window_x: None,
     },
     cmpr_cfg: CompressionConfig {
         shrink_range: (0.0005, 0.00001),
@@ -85,8 +119,13 @@ pub const DEFAULT_SPARROW_CONFIG: SparrowConfig = SparrowConfig {
                 n_container_samples: 50,
                 n_focussed_samples: 25,
                 n_coord_descents: 3,
+                window_home: None,
             },
+            small: SmallPieceConfig::OFF,
+            freeze_x: None,
         },
+        prop_shrink: false,
+        window_mode: false,
     },
     cde_config: CDEConfig {
         quadtree_depth: 4,

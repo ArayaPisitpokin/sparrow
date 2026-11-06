@@ -52,4 +52,5 @@ pub const LBF_SAMPLE_CONFIG: SampleConfig = SampleConfig {
     n_container_samples: 1000,
     n_focussed_samples: 0,
     n_coord_descents: 3,
+    window_home: None,
 };

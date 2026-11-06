@@ -7,6 +7,7 @@ use numfmt::{Formatter, Precision, Scales};
 use std::sync::LazyLock;
 
 pub mod grouped;
+pub mod small;
 pub mod optimizer;
 pub mod quantify;
 pub mod sample;

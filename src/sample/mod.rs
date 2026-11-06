@@ -1,4 +1,5 @@
 mod best_samples;
-mod coord_descent;
+pub mod coord_descent;
+pub mod levy_sampler;
 pub mod search;
 pub mod uniform_sampler;

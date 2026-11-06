@@ -1,6 +1,7 @@
 use crate::eval::sample_eval::{SampleEval, SampleEvaluator};
 use crate::eval::specialized_jaguars_pipeline::{collect_poly_collisions_in_detector_custom, SpecializedHazardCollector};
 use crate::quantify::tracker::CollisionTracker;
+use crate::small::positional_loss;
 use jagua_rs::collision_detection::hazards::collector::HazardCollector;
 use jagua_rs::entities::Item;
 use jagua_rs::entities::Layout;
@@ -14,6 +15,9 @@ pub struct SeparationEvaluator<'a> {
     collector: SpecializedHazardCollector<'a>,
     shape_buff: SPolygon,
     n_evals: usize,
+    /// Small-piece mechanism A: signed positional bias applied to collision-free
+    /// samples (0 = upstream behaviour, all clear samples tie at loss 0).
+    clear_bias: f32,
 }
 
 impl<'a> SeparationEvaluator<'a> {
@@ -31,7 +35,14 @@ impl<'a> SeparationEvaluator<'a> {
             collector,
             shape_buff: item.shape_cd.as_ref().clone(),
             n_evals: 0,
+            clear_bias: 0.0,
         }
+    }
+
+    /// Ranks collision-free samples by `crate::small::positional_loss` with this bias.
+    pub fn with_clear_bias(mut self, clear_bias: f32) -> Self {
+        self.clear_bias = clear_bias;
+        self
     }
 }
 
@@ -61,8 +72,15 @@ impl<'a> SampleEvaluator for SeparationEvaluator<'a> {
             // However, since we can asure that this sample will always be rejected, we don't need to spend any more time on it and just return `Invalid`.
             SampleEval::Invalid
         } else if self.collector.is_empty() {
-            // No collisions detected, return clear
-            SampleEval::Clear { loss: 0.0 }
+            // No collisions detected, return clear. Small-piece mechanism A ranks the
+            // clear samples of small items by position; `Clear` still always beats
+            // `Collision`, so feasibility is never traded for position.
+            let loss = if self.clear_bias != 0.0 {
+                positional_loss(self.clear_bias, self.shape_buff.bbox, self.layout.container.outer_cd.bbox)
+            } else {
+                0.0
+            };
+            SampleEval::Clear { loss }
         } else {
             // Some collisions detected but withing the upper bound, return collision with total loss
             SampleEval::Collision {

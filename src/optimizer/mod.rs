@@ -17,6 +17,7 @@ pub mod anneal;
 pub mod lbf;
 pub mod resolve;
 pub mod separator;
+pub mod small_relocate;
 mod worker;
 pub mod explore;
 pub mod compress;

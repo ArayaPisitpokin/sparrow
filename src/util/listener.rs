@@ -53,6 +53,33 @@ pub struct SearchStats {
     pub grouped_active: bool,
     /// Wall-clock seconds of the phase (measured once at the phase boundary).
     pub phase_secs: f32,
+    /// Placed pieces classified "small" by the small-piece cutoff (see `crate::small`).
+    pub n_small_items: u64,
+    /// Failed separations whose colliding pieces were all small / mixed / all large.
+    pub n_fail_small_only: u64,
+    pub n_fail_mixed: u64,
+    pub n_fail_big_only: u64,
+    /// Small-piece mechanism D: relocation events fired, events that reached
+    /// feasibility, and pieces re-placed in total.
+    pub n_small_relocate_events: u64,
+    pub n_small_relocate_success: u64,
+    pub n_small_pieces_relocated: u64,
+    /// Small-piece mechanism M: moves of collision-free small items (summed over workers).
+    pub voluntary_moves: u64,
+    /// Small-piece mechanism T: tidy passes run and pieces moved by them.
+    pub n_tidy_calls: u64,
+    pub n_tidy_moves: u64,
+    /// Small-piece mechanism N: nudge disruptions, panels pushed, and separations that
+    /// reached feasibility directly after a nudge.
+    pub n_nudges: u64,
+    pub n_panels_nudged: u64,
+    pub post_nudge_sep_success: u64,
+    /// Small-piece mechanism Y (T1): in-separation yield volleys fired, panels
+    /// stepped, separations that fired >=1 volley, and those that then separated.
+    pub n_yield_volleys: u64,
+    pub n_panels_yielded: u64,
+    pub n_sep_with_yield: u64,
+    pub n_sep_success_with_yield: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

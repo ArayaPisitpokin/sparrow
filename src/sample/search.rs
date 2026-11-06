@@ -2,18 +2,24 @@ use crate::consts::{PRE_REFINE_CD_R_STEPS, PRE_REFINE_CD_TL_RATIOS, SND_REFINE_C
 use crate::eval::sample_eval::{SampleEval, SampleEvaluator};
 use crate::sample::best_samples::BestSamples;
 use crate::sample::coord_descent::{refine_coord_desc, CDConfig};
+use crate::sample::levy_sampler::{levy_cfg, LevyMode, LevySampler};
 use crate::sample::uniform_sampler::UniformBBoxSampler;
 use jagua_rs::entities::{Item, Layout, PItemKey};
 use jagua_rs::geometry::geo_enums::RotationRange;
 use jagua_rs::geometry::DTransformation;
 use log::debug;
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SampleConfig {
     pub n_container_samples: usize,
     pub n_focussed_samples: usize,
     pub n_coord_descents: usize,
+    /// Window-homing (2026-09-01): when Some((x_hi, p)), each container-wide
+    /// sample is drawn from the sub-box [0, x_hi] x full height with
+    /// probability p (long-range relocations try the left window first);
+    /// focussed samples and coordinate descent stay unrestricted.
+    pub window_home: Option<(f32, f32)>,
 }
 
 /// Algorithm 6 and Figure 7 from https://doi.org/10.48550/arXiv.2509.13329
@@ -23,10 +29,15 @@ pub struct SampleConfig {
 pub fn search_placement(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, mut evaluator: impl SampleEvaluator, sample_config: SampleConfig, rng: &mut impl Rng, rot_lock: Option<f32>) -> (Option<(DTransformation, SampleEval)>, usize) {
     let item_min_dim = f32::min(item.shape_cd.bbox.width(), item.shape_cd.bbox.height());
 
+    // Experimental Lévy-flight sampling (env-gated; default reproduces upstream exactly).
+    let levy = levy_cfg();
+    let n_focussed = sample_config.n_focussed_samples * levy.mult;
+    let n_container = sample_config.n_container_samples * levy.mult;
+
     let mut best_samples = BestSamples::new(sample_config.n_coord_descents, item_min_dim * UNIQUE_SAMPLE_THRESHOLD);
 
     //Create the two uniform samplers, one focussed around the reference placement, one for the whole container
-    let focussed_sampler = match ref_pk {
+    let (focussed_sampler, levy_sampler) = match ref_pk {
         Some(ref_pk) => {
             //Add the current placement (and evaluation) as a candidate
             let dt = l.placed_items[ref_pk].d_transf;
@@ -35,18 +46,39 @@ pub fn search_placement(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, mut e
             debug!("[S] Starting from: {:?}", (dt, eval));
             best_samples.report(dt, eval);
 
-            //Create a uniform sampler focussed around the current placement
-            let pi_bbox = l.placed_items[ref_pk].shape.bbox;
-            UniformBBoxSampler::new(pi_bbox, item, l.container.outer_cd.bbox, rot_lock)
+            match levy.mode {
+                LevyMode::Off => {
+                    //Create a uniform sampler focussed around the current placement
+                    let pi_bbox = l.placed_items[ref_pk].shape.bbox;
+                    (UniformBBoxSampler::new(pi_bbox, item, l.container.outer_cd.bbox, rot_lock), None)
+                }
+                LevyMode::ReplaceFocussed => {
+                    //Lévy flight centred on the current translation, median displacement = item_min_dim
+                    (None, LevySampler::new(dt.translation(), item, l.container.outer_cd.bbox, rot_lock, item_min_dim, levy))
+                }
+            }
         }
-        None => None,
+        None => (None, None),
     };
     let container_sampler = UniformBBoxSampler::new(l.container.outer_cd.bbox, item, l.container.outer_cd.bbox, rot_lock);
+    let home_sampler = sample_config.window_home.and_then(|(x_hi, _)| {
+        let cb = l.container.outer_cd.bbox;
+        let wb = jagua_rs::geometry::primitives::Rect::try_new(
+            cb.x_min, cb.y_min, (cb.x_min + x_hi).min(cb.x_max), cb.y_max).ok()?;
+        UniformBBoxSampler::new(wb, item, cb, rot_lock)
+    });
 
-    //Perform the focussed sampling
+    //Perform the focussed sampling (uniform-in-bbox, or Lévy when enabled)
     if let Some(focussed_sampler) = focussed_sampler {
-        for _ in 0..sample_config.n_focussed_samples {
+        for _ in 0..n_focussed {
             let dt = focussed_sampler.sample(rng);
+            let eval = evaluator.evaluate_sample(dt, Some(best_samples.upper_bound()));
+            best_samples.report(dt, eval);
+        }
+    }
+    if let Some(levy_sampler) = levy_sampler {
+        for _ in 0..n_focussed {
+            let dt = levy_sampler.sample(rng);
             let eval = evaluator.evaluate_sample(dt, Some(best_samples.upper_bound()));
             best_samples.report(dt, eval);
         }
@@ -54,8 +86,12 @@ pub fn search_placement(l: &Layout, item: &Item, ref_pk: Option<PItemKey>, mut e
 
     //Perform the container-wide sampling
     if let Some(container_sampler) = container_sampler {
-        for _ in 0..sample_config.n_container_samples {
-            let dt = container_sampler.sample(rng);
+        let home_p = sample_config.window_home.map_or(0.0, |(_, p)| p);
+        for _ in 0..n_container {
+            let dt = match &home_sampler {
+                Some(hs) if rng.random::<f32>() < home_p => hs.sample(rng),
+                _ => container_sampler.sample(rng),
+            };
             let eval = evaluator.evaluate_sample(dt, Some(best_samples.upper_bound()));
             best_samples.report(dt, eval);
         }

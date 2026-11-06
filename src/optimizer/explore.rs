@@ -1,6 +1,7 @@
 use crate::config::ExplorationConfig;
 use crate::grouped::GroupedOrientationSpec;
 use crate::optimizer::separator::{Separator, SeparatorConfig};
+use crate::optimizer::small_relocate::{classify_colliders, nudge_panels_around_jam, relocate_colliding_smalls, tidy_smalls};
 use crate::sample::uniform_sampler::convert_sample_to_closest_feasible;
 use crate::util::listener::{ReportType, SearchStats, SolutionListener, StatsPhase};
 use crate::util::terminator::Terminator;
@@ -16,7 +17,7 @@ use jagua_rs::probs::spp::entities::{SPInstance, SPSolution};
 use log::{debug, info, warn};
 use ordered_float::OrderedFloat;
 use rand::prelude::{Distribution, IndexedRandom, IteratorRandom};
-use rand::RngExt;
+use rand::{Rng, RngExt};
 use rand_distr::Normal;
 use slotmap::SecondaryMap;
 use std::cmp::Reverse;
@@ -27,6 +28,9 @@ use std::cmp::Reverse;
 /// flip whole garment groups (see `crate::grouped`); when `None`, behavior is
 /// identical to upstream.
 pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listener: &mut impl SolutionListener, term: &impl Terminator, config: &ExplorationConfig, grouped: Option<&GroupedOrientationSpec>) -> Vec<SPSolution> {
+    if let Some(wx) = config.window_x {
+        return window_ladder_phase(instance, sep, sol_listener, term, config, wx);
+    }
     let mut current_width = sep.prob.strip_width();
     let mut best_width = current_width;
 
@@ -50,6 +54,8 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
     // Fork-at-swap: the swapped-only variant awaiting its own separation attempt
     // (the flipped variant runs first; the pool ditches whichever loses).
     let mut pending_fork: Option<SPSolution> = None;
+    // Small-piece mechanism N: consecutive nudge disruptions since the last success/swap.
+    let mut consecutive_nudges: u8 = 0;
     // Soft-anneal bookkeeping: whether the end-of-window projection has run, and
     // the index in `feasible_sols` from which entries satisfy the group invariant
     // (mid-anneal feasible layouts are mixed-orientation and must not be returned).
@@ -120,9 +126,34 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             }
         }
 
+        // Small-piece mechanism T: tidy the small pieces on the master state before
+        // the separation (persists, unlike in-separation voluntary moves).
+        if sep.config.small.tidy_mode > 0 {
+            tidy_smalls(sep, &mut stats, sep.config.small.tidy_mode >= 2);
+        }
+
         // Attempt to separate the current layout
-        let local_best = sep.separate(term, sol_listener);
-        let total_loss = local_best.1.get_total_loss();
+        let mut local_best = sep.separate(term, sol_listener);
+        let mut total_loss = local_best.1.get_total_loss();
+
+        // Small-piece mechanisms (see `crate::small`): classify who is colliding in a
+        // failed separation; under D, a small-only colliding set gets its pieces
+        // re-placed by a dense clear-position search before this counts as a failure
+        // (the swap disruption below would otherwise tear up the large pieces to fix
+        // a small-piece problem).
+        let mut census = None;
+        if total_loss > 0.0 {
+            let c = classify_colliders(sep);
+            c.record(&mut stats);
+            if sep.config.small.relocate_enabled() {
+                sep.rollback(&local_best.0, Some(&local_best.1));
+                if relocate_colliding_smalls(sep, c, &mut stats).is_some_and(|n| n > 0) {
+                    local_best = (sep.prob.save(), sep.ct.save());
+                    total_loss = local_best.1.get_total_loss();
+                }
+            }
+            census = Some(classify_colliders(sep));
+        }
 
         // Attribute this separation's outcome to the disruption that preceded it.
         if let Some(kind) = last_disruption.take() {
@@ -130,12 +161,14 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
                 match kind {
                     DisruptionKind::Swap => stats.post_swap_sep_success += 1,
                     DisruptionKind::Flip => stats.post_flip_sep_success += 1,
+                    DisruptionKind::Nudge => stats.post_nudge_sep_success += 1,
                 }
             }
         }
 
         if total_loss == 0.0 {
             // If successfully separated
+            consecutive_nudges = 0;
             if current_width < best_width {
                 info!("[EXPL] feasible solution found! (width: {:.3}, dens: {:.3}%)",current_width,sep.prob.density() * 100.0);
                 best_width = current_width;
@@ -145,7 +178,34 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
             // Shrink the strip width and clear the infeasible solution pool
             let next_width = current_width * (1.0 - config.shrink_step);
             info!("[EXPL] shrinking strip by {}%: {:.3} -> {:.3}", config.shrink_step * 100.0, current_width, next_width);
-            sep.change_strip_width(next_width, None);
+            if config.prop_shrink {
+                sep.change_strip_width_prop(next_width);
+            } else {
+                let t_frac = (phase_start.elapsed().as_secs_f32()
+                    / config.time_limit.as_secs_f32().max(f32::EPSILON)).clamp(0.0, 1.0);
+                let mode = if config.random_split && config.split_mode == 0 { 1 } else { config.split_mode };
+                let split = match mode {
+                    1 => Some(sep.rng.random_range(0.0..current_width)),
+                    2 => Some(config.split_frac.clamp(0.0, 1.0) * current_width),
+                    3 => Some(t_frac * current_width),
+                    4 => Some((1.0 - t_frac) * current_width),
+                    // 5: split_frac carries an ABSOLUTE mm window length; the cut
+                    // lands uniformly in its outer half (pulls material across the
+                    // line), capped inside the current strip
+                    5 => Some(sep.rng
+                        .random_range((0.5 * config.split_frac)..config.split_frac)
+                        .min(current_width * 0.95)),
+                    _ => None,
+                };
+                // positional freeze: cuts (and the resulting slide) stay strictly
+                // right of every frozen piece
+                let split = if sep.freeze_clamp > 0.0 {
+                    Some(split.unwrap_or(current_width / 2.0).max(sep.freeze_clamp + 1.0))
+                } else {
+                    split
+                };
+                sep.change_strip_width(next_width, split);
+            }
             current_width = next_width;
             infeas_sol_pool.clear();
             pending_fork = None; // stale: snapshot was taken at the pre-shrink width
@@ -193,6 +253,25 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
                 last_disruption = Some(DisruptionKind::Swap);
                 continue;
             }
+
+            // Small-piece mechanism N: a jam of small pieces among clear (hence inert)
+            // panels is answered by pushing the bordering panels outward and separating
+            // again, not by swapping two large items across the strip. After
+            // `nudge_max` consecutive nudges the swap disruption below takes over.
+            if let Some(c) = census {
+                let mode = sep.config.small.nudge_mode;
+                let fires = mode > 0
+                    && c.n_small > 0
+                    && (mode == 2 || c.n_big == 0)
+                    && consecutive_nudges < sep.config.small.nudge_max;
+                if fires && nudge_panels_around_jam(sep, &mut stats) > 0 {
+                    consecutive_nudges += 1;
+                    stats.n_disruptions += 1;
+                    last_disruption = Some(DisruptionKind::Nudge);
+                    continue;
+                }
+            }
+            consecutive_nudges = 0;
 
             // Restore to a random solution from the pool, with better solutions having more chance to be selected
             let selected_sol = {
@@ -281,6 +360,13 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
     stats.n_separate_calls = sep.cum_separate_calls;
     stats.total_moves = sep.cum_moves;
     stats.total_evals = sep.cum_evals;
+    stats.voluntary_moves = sep.cum_voluntary_moves;
+    stats.n_yield_volleys = sep.cum_yield_volleys;
+    stats.n_panels_yielded = sep.cum_panels_yielded;
+    stats.n_sep_with_yield = sep.cum_sep_with_yield;
+    stats.n_sep_success_with_yield = sep.cum_sep_success_with_yield;
+    stats.n_small_items = sep.prob.layout.placed_items.iter()
+        .filter(|(_, pi)| sep.small_items[pi.item_id]).count() as u64;
     stats.phase_secs = phase_start.elapsed().as_secs_f32();
     sol_listener.on_search_stats(StatsPhase::Exploration, &stats);
 
@@ -292,6 +378,7 @@ pub fn exploration_phase(instance: &SPInstance, sep: &mut Separator, sol_listene
 enum DisruptionKind {
     Swap,
     Flip,
+    Nudge,
 }
 
 /// Grouped-orientation disruption: flips `n_garments_per_flip` whole garments
@@ -501,7 +588,8 @@ fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) -> Option<(
     // Step 2: Select two 'large' items and 'swap' them.
 
     let large_items = sep.prob.layout.placed_items.iter()
-        .filter(|(_, pi)| pi.shape.surrogate().convex_hull_area >= ch_area_cutoff);
+        .filter(|(_, pi)| pi.shape.surrogate().convex_hull_area >= ch_area_cutoff)
+        .filter(|(_, pi)| !crate::optimizer::separator::pi_frozen(&sep.frozen, pi));
 
     //Choose a first item with a large enough convex hull
     let (pk1, pi1) = large_items.clone().choose(&mut sep.rng).expect("[DSRP] failed to choose first item");
@@ -518,6 +606,7 @@ fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) -> Option<(
         .or_else(|| {
             sep.prob.layout.placed_items.iter()
                 .filter(|(pk, _)| *pk != pk1) // Ensure the second item is not the same as the first
+                .filter(|(_, pi)| !crate::optimizer::separator::pi_frozen(&sep.frozen, pi))
                 .choose(&mut sep.rng)
         }) // As a fallback, choose any item
         .expect("[EXPL] failed to choose second item for disruption");
@@ -560,6 +649,9 @@ fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) -> Option<(
 
         for c1_pk in practically_contained_items(&sep.prob.layout, pk1).into_iter().filter(|c1_pk| *c1_pk != pk2) {
             let c1_pi = &sep.prob.layout.placed_items[c1_pk];
+            if crate::optimizer::separator::pi_frozen(&sep.frozen, c1_pi) {
+                continue;
+            }
             let own_rotation = c1_pi.d_transf.rotation();
 
             let new_dt = c1_pi.d_transf
@@ -585,6 +677,9 @@ fn disrupt_solution(sep: &mut Separator, config: &ExplorationConfig) -> Option<(
 
         for c2_pk in practically_contained_items(&sep.prob.layout, pk2).into_iter().filter(|c2_pk| *c2_pk != pk1) {
             let c2_pi = &sep.prob.layout.placed_items[c2_pk];
+            if crate::optimizer::separator::pi_frozen(&sep.frozen, c2_pi) {
+                continue;
+            }
             let own_rotation = c2_pi.d_transf.rotation();
             let new_dt = c2_pi.d_transf
                 .compose()
@@ -625,4 +720,158 @@ fn practically_contained_items(layout: &Layout, pk_c: PItemKey) -> Vec<PItemKey>
             pi_c.shape.collides_with(&poi.center)
         })
         .collect_vec()
+}
+/// Window-ladder exploration (2026-09-01). The ladder metric is the exact covered
+/// area of the fixed window [0, wx] (pieces straddling x = wx earn their left
+/// part), not the strip width. Each round: cut-and-slide with the cut INSIDE the
+/// window (mostly near wx — injecting material across the line; sometimes deep —
+/// re-melting the frozen interior), stock separate() with unrestricted candidates,
+/// then the acceptance rule: keep iff the window area grew, else rollback+strike.
+/// The strip's right wall is parked 10% out so the window never feels it.
+/// Window-ladder exploration, v2 (2026-09-01). Mixed rounds:
+///   LENGTH round (p=0.5): stock global shrink (cut anywhere) — supplies the
+///     whole-strip compaction that stock sparrow's window density rides on;
+///     accepted iff feasible AND the window area did not shrink.
+///   WINDOW round: cut-and-slide with the cut INSIDE [0, wx] — leftward
+///     redistribution; accepted iff the window area strictly grew.
+/// Both round kinds rollback to the incumbent on rejection, so window density
+/// is monotone non-decreasing across accepted rounds (the owner's rule).
+pub fn window_ladder_phase(
+    instance: &SPInstance,
+    sep: &mut Separator,
+    sol_listener: &mut impl SolutionListener,
+    term: &impl Terminator,
+    config: &ExplorationConfig,
+    wx: f32,
+) -> Vec<SPSolution> {
+    let w0 = sep.prob.strip_width();
+    sep.change_strip_width(w0 * 1.02, None);       // small slack; length rounds will squeeze
+    let mut current_width = sep.prob.strip_width();
+    let mut feasible_sols = vec![sep.prob.save()];
+    sol_listener.report(ReportType::ExplFeas, &feasible_sols[0], instance);
+
+    let mut best_sol = sep.prob.save();
+    let mut best_area = window_area(&sep.prob.layout, wx);
+    info!("[WLAD] v2 start: x = {:.1}, width {:.1}, initial window area {:.0}", wx, current_width, best_area);
+
+    let mut delta = 12.0f32;
+    let (dmin, dmax) = (1.5f32, 40.0f32);
+    let (mut rounds, mut acc_len, mut acc_win, mut infeas) = (0u64, 0u64, 0u64, 0u64);
+    let phase_start = jagua_rs::Instant::now();
+    let mut stats = SearchStats::default();
+
+    while !term.kill() {
+        rounds += 1;
+        let length_round = sep.rng.random::<f32>() < 0.5;
+        if length_round {
+            let next_width = current_width * (1.0 - config.shrink_step);
+            let split = sep.rng.random_range(0.0..current_width);
+            sep.change_strip_width(next_width, Some(split));
+            current_width = next_width;
+        } else {
+            let cut = if sep.rng.random::<f32>() < 0.7 {
+                sep.rng.random_range(0.70 * wx..wx)
+            } else {
+                sep.rng.random_range(0.20 * wx..0.70 * wx)
+            };
+            let moves = sep.prob.layout.placed_items.iter()
+                .filter(|(_, pi)| pi.shape.centroid().0 > cut)
+                .map(|(pk, pi)| {
+                    let dt = pi.d_transf;
+                    let t = dt.translation();
+                    (pk, DTransformation::new(dt.rotation(), (t.0 - delta, t.1)))
+                })
+                .collect::<Vec<_>>();
+            for (pk, dt) in moves {
+                sep.move_item(pk, dt);
+            }
+        }
+
+        let (sol, ct) = sep.separate(term, sol_listener);
+        let feasible = ct.get_total_loss() == 0.0;
+        let mut accepted = false;
+        if feasible {
+            // measure exactly the state we would keep: snap the problem to the
+            // separator's returned best before evaluating the window
+            sep.rollback(&sol, None);
+            let wa = window_area(&sep.prob.layout, wx);
+            let ok = if length_round { wa >= best_area - 1.0 } else { wa > best_area + 1.0 };
+            if ok {
+                accepted = true;
+                if wa > best_area {
+                    best_area = wa;
+                }
+                best_sol = sol.clone();
+                if length_round { acc_len += 1 } else { acc_win += 1 };
+                sol_listener.report(ReportType::ExplFeas, &sol, instance);
+                feasible_sols.push(sol);
+                if !length_round {
+                    delta = (delta * 1.15).min(dmax);
+                }
+            }
+        } else {
+            infeas += 1;
+        }
+        if !accepted {
+            sep.rollback(&best_sol, None);
+            current_width = sep.prob.strip_width();
+            if !length_round {
+                delta = (delta * 0.85).max(dmin);
+            }
+        }
+    }
+
+    info!("[WLAD] v2 finished: {} rounds ({} len-acc, {} win-acc, {} infeasible), best window area {:.0}, width {:.1}",
+          rounds, acc_len, acc_win, infeas, best_area, current_width);
+    stats.n_shrinks = acc_len;
+    stats.n_disruptions = acc_win;
+    stats.n_separate_calls = sep.cum_separate_calls;
+    stats.total_moves = sep.cum_moves;
+    stats.total_evals = sep.cum_evals;
+    stats.phase_secs = phase_start.elapsed().as_secs_f32();
+    sol_listener.on_search_stats(StatsPhase::Exploration, &stats);
+    feasible_sols.push(best_sol);
+    feasible_sols
+}
+
+/// Exact layout area strictly left of x = wx. Consulted only on feasible
+/// (overlap-free) layouts, where the per-item sum equals the union.
+fn window_area(layout: &Layout, wx: f32) -> f32 {
+    layout.placed_items.iter()
+        .map(|(_, pi)| clipped_area_left(&pi.shape.vertices, wx))
+        .sum()
+}
+
+/// Shoelace area of a simple polygon clipped to the half-plane x <= wx
+/// (Sutherland-Hodgman against a single vertical line).
+fn clipped_area_left(pts: &[jagua_rs::geometry::primitives::Point], wx: f32) -> f32 {
+    let n = pts.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut out: Vec<(f32, f32)> = Vec::with_capacity(n + 4);
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let (ain, bin) = (a.0 <= wx, b.0 <= wx);
+        if ain && bin {
+            out.push((b.0, b.1));
+        } else if ain != bin {
+            let t = (wx - a.0) / (b.0 - a.0);
+            out.push((wx, a.1 + t * (b.1 - a.1)));
+            if bin {
+                out.push((b.0, b.1));
+            }
+        }
+    }
+    if out.len() < 3 {
+        return 0.0;
+    }
+    let mut s = 0.0;
+    for i in 0..out.len() {
+        let (x1, y1) = out[i];
+        let (x2, y2) = out[(i + 1) % out.len()];
+        s += x1 * y2 - x2 * y1;
+    }
+    (s * 0.5).abs()
 }
